@@ -1,0 +1,9 @@
+torch
+transformers
+numpy
+datasets
+jinja2
+faiss-cpu
+requests
+flask
+sentence_transformers
