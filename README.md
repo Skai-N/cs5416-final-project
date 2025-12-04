@@ -70,8 +70,7 @@ Grades for this project will be primarily based on how many systems concepts you
 **All Tier 1 requirements PLUS:**
 - True microservices architecture (pipeline separated into distinct parts that communicate with each other cross-node)
 - Orchestration and request routing across nodes
-- Per-node memory and full pipeline throughput profiling of at least 2 optimizations (e.g. which services to put on which nodes, maximum batch size, 3 monolithic pipeliens versus microservices implementation, etc)
-- Memory, throughput, and latnecy vs batch size analysis for each pipeline step
+- More robust profiling (details in report section)
 - Clear documentation of design decisions in report
 - Explanation of how your profiling led to your final configuration
 
@@ -96,7 +95,7 @@ Your task: implement the pipeline as a distributed system across 3 nodes.
 
 The pipeline stages are:
 1. **Embedder** on the query string
-2. **FAISS RAG lookup** (ANN) — retrieve top-10 docs using the embedding. 
+2. **FAISS RAG lookup** (ANN) — retrieve top-10 docs using the embedding
 3. **Fetch documents** from disk based on step 2
 4. **Reranker** on the docs from step 3
 5. **LLM response generation** (max 128 tokens) using the reranked docs from step 4
@@ -230,43 +229,74 @@ If you choose to implement GPU support:
 Submit your full codebase with:
 - `install.sh` (no sudo)
 - `run.sh` (entry point for each node)
-- Full source code
+- Full source code to run your pipeline
+- Any code related to the experiments or microbenchmarks you ran
 
 ### 10.2 Report
 
 **IMPORTANT:** The profiling that you do for the report should be done on UGClinux or your group's local computers. If you implement GPU acceleration, you do not need to worry about running your profiling on GPUs. As long your GPU implentation works, you will receive full credit for your GPU implementation even if your report profiling is done on CPU
 
+**Report Weight:** Your report is an important part of your grade. A well documented system with thorough analysis will earn a higher grade than a poorly motivated one
+
+**Report Goal:** The below requirements are there to give you ideas of what to include in your report. Since this is an open ended project, every group may implement different different optimizations or perform different experiments. The goal of the report is to:
+
+1. Explain what you implemented and how you implemented it
+2. Show us the thought processes behind your design decisions and the experiments that motivated what you ended up choosing 
+
+Reports that better achieve these goals will receive higher grades
+
 Your report must include:
 
-#### Required Sections (All Submissions):
+#### Required Content (All Submissions):
 1. **System design overview**
    - How you distributed work across 3 nodes
    - How requests flow through your system
-   - Diagrams would be helpful here
+   - Diagrams are encouraged for this
 
-2. **Batching implementation**
-   - What stages use batching
-   - Batch size choices and rationale
+2. **System implementation details**
+   - Detail what exactly you implemented or changed beyond the starter code. E.g.:
+      - Your setup for routing requests
+      - How you implemented your optimizations
+      - Anything else you implemented
+   - Explain any tools/packages you used in your implementation
 
-3. **Basic profiling**
-   - Memory usage per node
-   - Overall throughput
+3. **Batching implementation**
+   - What stages use batching?
+   - What was your choice of batch size, and what experiments informed that decision?
+   - Plots are encouraged for this
 
-#### Additional Sections for Higher Grades:
-5. **Optimization steps** (if implemented)
-   - Microservice architecture details (Diagrams would be helpful here)
-   - Opportunistic batching strategy
-   - Any other optimizations you implemented (e.g. caching, data transfer, etc)
-   - You should both detail the implementation details of your optimization steps as well as justification for why you chose them
+4. **Basic profiling**
+   - Show the peak memory used by your processes per node
+   - Show the tradeoffs between throughput and memory usage across different choices of batch size for your pipeline
+   - Measure the maximum throughput in requests/minute that your system can handle
+   - Measure the latency of your system when under low load
+   - Charts/Plots are encouraged here
 
-6. **Comprehensive experiments** (if performed)
-   - Microbenchmarks per stage
-   - Memory vs. batch size analysis
-   - Throughput vs. batch size analysis
-   - Latency vs batch size analysis
-   - Analysis of 2+ tunable facets
+#### Additional Content for Higher Grades:
+5. **Optimization steps**
+   - An explanation and a diagram showing how you broke up your system into microservices
+   - An explanation and a diragram of how requests are routed through your system
+   - If implemented, what your opportunistic batching strategy was and why you chose the configuration you did
+   - If implemented, detail other optimizations you made (e.g. caching, data transfer, etc)
+   - You should both explain the techincal implementation details of your optimization steps as well as justification for why you chose them
 
-7. **GPU section** (if implemented)
+6. **Comprehensive experiments**
+   - The exact experiments that you run are up to you. Your goal should be to run experiments that will help you understand your system and decide how to tune your optimizations. For example, you could:
+      - Run microbenchmarks to profile the throughput and memory for each pipeline stage versus different batch sizes to help you decide how to break them up into microservices
+      - Evaluate the performance of two different choices of microservice pipeline structure (something like having 1 faiss and 2 llm vs 2 faiss and 1 llm)
+      - Explore the effects of tunable facets of your optimizations on latency and throughput
+      - Isolate the impact of each individual optimization you made to see its effect by measuring throughput with it on/off
+      - Identify were systems-level bottlenecks lie
+      - Any other experiments you feel would help you optimize your pipeline
+   - You should run experiments that will actually help you decide how to optimize your pipeline and document the process and results in your report
+   - Charts/Plots encouraged
+
+7. **Relating experiments to design decisions***
+   - Justification of why you chose the experiments you chose to run 
+   - Explanation of how your experiments informed the structure of your pipeline and the parameters of optimizations you made
+   - Discussion of any tradeoffs you encountered 
+
+8. **GPU section** (if implemented)
    - What you offloaded to GPU
    - Where there were CPU<->GPU transfers
    - Whether you used both CPU and GPU simultaneously

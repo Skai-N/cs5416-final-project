@@ -1,5 +1,5 @@
 faiss_index.bin
-documents/documents.db
+documents/
 .venv/
 __pycache__/
 test.py

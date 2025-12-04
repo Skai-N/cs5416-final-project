@@ -7,7 +7,7 @@ def _initialize_documents():
         """Create dummy documents database if it doesn't exist"""
 
         DOCUMENTS_DIR = "documents/"
-        NUM_DOCUMENTS = 1000000
+        NUM_DOCUMENTS = 4500000
         os.makedirs(DOCUMENTS_DIR, exist_ok=True)
 
         db_path = os.path.join(DOCUMENTS_DIR, "documents.db")
@@ -31,7 +31,7 @@ def _initialize_documents():
             batch_size = 10000
             documents = []
             
-            for i in range(1000000):
+            for i in range(NUM_DOCUMENTS):
                 documents.append((
                     i,
                     f'Document {i}',
@@ -64,7 +64,7 @@ def _initialize_documents():
 def _create_faiss_index():
         """Create a large FAISS index"""
         dim = 768
-        num_docs = 1000000
+        num_docs = 4500000
         index_path = "faiss_index.bin"
 
         nlist=4096

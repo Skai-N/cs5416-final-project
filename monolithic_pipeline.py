@@ -21,8 +21,6 @@ from flask import Flask, request, jsonify
 from queue import Queue
 import threading
 
-from memory_profiler import profile
-
 # Read environment variables
 TOTAL_NODES = int(os.environ.get('TOTAL_NODES', 1))
 NODE_NUMBER = int(os.environ.get('NODE_NUMBER', 0))
@@ -158,7 +156,6 @@ class MonolithicPipeline:
         
         return responses
     
-    @profile
     def _generate_embeddings_batch(self, texts: List[str]) -> np.ndarray:
         """Step 2: Generate embeddings for a batch of queries"""
         model = SentenceTransformer(self.embedding_model_name).to(self.device)
@@ -171,7 +168,6 @@ class MonolithicPipeline:
         gc.collect()
         return embeddings
     
-    @profile
     def _faiss_search_batch(self, query_embeddings: np.ndarray) -> List[List[int]]:
         """Step 3: Perform FAISS ANN search for a batch of embeddings"""
         if not os.path.exists(CONFIG['faiss_index_path']):
@@ -185,7 +181,6 @@ class MonolithicPipeline:
         gc.collect()
         return [row.tolist() for row in indices]
     
-    @profile
     def _fetch_documents_batch(self, doc_id_batches: List[List[int]]) -> List[List[Dict]]:
         """Step 4: Fetch documents for each query in the batch using SQLite"""
         db_path = f"{CONFIG['documents_path']}/documents.db"
@@ -211,7 +206,6 @@ class MonolithicPipeline:
         conn.close()
         return documents_batch
     
-    @profile
     def _rerank_documents_batch(self, queries: List[str], documents_batch: List[List[Dict]]) -> List[List[Dict]]:
         """Step 5: Rerank retrieved documents for each query in the batch"""
         tokenizer = AutoTokenizer.from_pretrained(self.reranker_model_name)
@@ -239,7 +233,6 @@ class MonolithicPipeline:
         gc.collect()
         return reranked_batches
     
-    @profile
     def _generate_responses_batch(self, queries: List[str], documents_batch: List[List[Dict]]) -> List[str]:
         """Step 6: Generate LLM responses for each query in the batch"""
         model = AutoModelForCausalLM.from_pretrained(
@@ -277,7 +270,6 @@ class MonolithicPipeline:
         gc.collect()
         return responses
     
-    @profile
     def _analyze_sentiment_batch(self, texts: List[str]) -> List[str]:
         """Step 7: Analyze sentiment for each generated response"""
         classifier = hf_pipeline(
@@ -301,7 +293,6 @@ class MonolithicPipeline:
         gc.collect()
         return sentiments
     
-    @profile
     def _filter_response_safety_batch(self, texts: List[str]) -> List[bool]:
         """Step 8: Filter responses for safety for each entry in the batch"""
         classifier = hf_pipeline(
@@ -354,6 +345,7 @@ def process_requests_worker():
         except Exception as e:
             print(f"Error processing request: {e}")
             request_queue.task_done()
+
 
 @app.route('/query', methods=['POST'])
 def handle_query():
@@ -435,6 +427,7 @@ def main():
     hostname = NODE_0_IP.split(':')[0]
     port = int(NODE_0_IP.split(':')[1]) if ':' in NODE_0_IP else 8000
     app.run(host=hostname, port=port, threaded=True)
+
 
 if __name__ == "__main__":
     main()
