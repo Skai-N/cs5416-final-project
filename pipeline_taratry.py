@@ -22,6 +22,7 @@ from queue import Queue
 import threading
 import traceback
 import requests
+from memory_profiler import profile
 
 warnings.filterwarnings("ignore")
 
@@ -79,7 +80,7 @@ class MonolithicPipeline:
         self.llm_model_name = 'Qwen/Qwen2.5-0.5B-Instruct'
         self.sentiment_model_name = 'nlptown/bert-base-multilingual-uncased-sentiment'
         self.safety_model_name = 'unitary/toxic-bert'
-
+    @profile
     def _generate_embeddings_batch(self, texts: List[str]) -> np.ndarray:
         """Step 2: Generate embeddings for a batch of queries"""
         model = SentenceTransformer(self.embedding_model_name).to(self.device)
@@ -91,7 +92,7 @@ class MonolithicPipeline:
         del model
         gc.collect()
         return embeddings
-
+    @profile
     def _faiss_search_batch(self, query_embeddings: np.ndarray) -> List[List[int]]:
         """Step 3: Perform FAISS ANN search for a batch of embeddings"""
         if not os.path.exists(CONFIG['faiss_index_path']):
@@ -104,7 +105,7 @@ class MonolithicPipeline:
         del index
         gc.collect()
         return [row.tolist() for row in indices]
-
+    @profile
     def _fetch_documents_batch(self, doc_id_batches: List[List[int]]) -> List[List[Dict]]:
         """Step 4: Fetch documents for each query in the batch using SQLite"""
         db_path = f"{CONFIG['documents_path']}/documents.db"
@@ -129,7 +130,7 @@ class MonolithicPipeline:
             documents_batch.append(documents)
         conn.close()
         return documents_batch
-
+    @profile
     def _rerank_documents_batch(self, queries: List[str], documents_batch: List[List[Dict]]) -> List[List[Dict]]:
         """Step 5: Rerank retrieved documents for each query in the batch"""
         tokenizer = AutoTokenizer.from_pretrained(self.reranker_model_name)
@@ -156,7 +157,7 @@ class MonolithicPipeline:
         del model, tokenizer
         gc.collect()
         return reranked_batches
-
+    @profile
     def _generate_responses_batch(self, queries: List[str], documents_batch: List[List[Dict]]) -> List[str]:
         """Step 6: Generate LLM responses for each query in the batch"""
 
@@ -196,7 +197,7 @@ class MonolithicPipeline:
         del model, tokenizer
         gc.collect()
         return responses
-
+    @profile
     def _analyze_sentiment_batch(self, texts: List[str]) -> List[str]:
         """Step 7: Analyze sentiment for each generated response"""
 
@@ -220,7 +221,7 @@ class MonolithicPipeline:
         del classifier
         gc.collect()
         return sentiments
-
+    @profile
     def _filter_response_safety_batch(self, texts: List[str]) -> List[bool]:
         """Step 8: Filter responses for safety for each entry in the batch"""
 
