@@ -148,26 +148,35 @@ class MonolithicPipeline:
 
             self.db_path = f"{CONFIG['documents_path']}/documents.db"
             self.db_conn = sqlite3.connect(self.db_path, check_same_thread=False)
+    
     # @profile
     def _generate_embeddings_batch(self, texts: List[str]) -> np.ndarray:
         """Step 2: Generate embeddings for a batch of queries """
+        step_start = time.time()
         embeddings = self.embedding_model.encode(
             texts,
             normalize_embeddings=True,
             convert_to_numpy=True
         )
+        step_time = time.time() - step_start
+        print(f"[Node {NODE_NUMBER}] Embedding generation: {step_time:.4f}s (batch size: {len(texts)})")
         return embeddings
     
     # @profile
     def _faiss_search_batch(self, query_embeddings: np.ndarray) -> List[List[int]]:
         """Step 3: Perform FAISS ANN search for a batch of embeddings """
+        step_start = time.time()
         query_embeddings = query_embeddings.astype('float32')
         _, indices = self.index.search(query_embeddings, CONFIG['retrieval_k'])
-        return [row.tolist() for row in indices]
+        result = [row.tolist() for row in indices]
+        step_time = time.time() - step_start
+        print(f"[Node {NODE_NUMBER}] FAISS search: {step_time:.4f}s (batch size: {len(query_embeddings)})")
+        return result
     
     # @profile
     def _fetch_documents_batch(self, doc_id_batches: List[List[int]]) -> List[List[Dict]]:
         """Step 4: Fetch documents for each query in the batch using SQLite """
+        step_start = time.time()
         cursor = self.db_conn.cursor()
         documents_batch = []
         for doc_ids in doc_id_batches:
@@ -186,11 +195,14 @@ class MonolithicPipeline:
                         'category': result[3]
                     })
             documents_batch.append(documents)
+        step_time = time.time() - step_start
+        print(f"[Node {NODE_NUMBER}] Document fetching: {step_time:.4f}s (batch size: {len(doc_id_batches)})")
         return documents_batch
     
     # @profile
     def _rerank_documents_batch(self, queries: List[str], documents_batch: List[List[Dict]]) -> List[List[Dict]]:
         """Step 5: Rerank retrieved documents for each query in the batch"""
+        step_start = time.time()
         reranked_batches = []
         for query, documents in zip(queries, documents_batch):
             if not documents:
@@ -209,45 +221,17 @@ class MonolithicPipeline:
             doc_scores = list(zip(documents, scores))
             doc_scores.sort(key=lambda x: x[1], reverse=True)
             reranked_batches.append([doc for doc, _ in doc_scores])
+        step_time = time.time() - step_start
+        print(f"[Node {NODE_NUMBER}] Document reranking: {step_time:.4f}s (batch size: {len(queries)})")
         return reranked_batches
     
     # @profile
-    # def _generate_responses_batch(self, queries: List[str], documents_batch: List[List[Dict]]) -> List[str]:
-    #     """Step 6: Generate LLM responses for each query in the batch (Node 2 only)"""
-    #     responses = []
-    #     for query, documents in zip(queries, documents_batch):
-    #         context = "\n".join([f"- {doc['title']}: {doc['content'][:200]}" for doc in documents[:3]])
-    #         messages = [
-    #             {"role": "system",
-    #              "content": "When given Context and Question, reply as 'Answer: <final answer>' only."},
-    #             {"role": "user",
-    #              "content": f"Context:\n{context}\n\nQuestion: {query}\n\nAnswer:"}
-    #         ]
-            
-    #         text = self.llm_tokenizer.apply_chat_template(
-    #             messages,
-    #             tokenize=False,
-    #             add_generation_prompt=True
-    #         )
-
-    #         model_inputs = self.llm_tokenizer([text], return_tensors="pt").to(self.device)
-    #         generated_ids = self.llm_model.generate(
-    #             **model_inputs,
-    #             max_new_tokens=CONFIG['max_tokens'],
-    #             temperature=0.01,
-    #             pad_token_id=self.llm_tokenizer.eos_token_id
-    #         )
-    #         generated_ids = [
-    #             output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
-    #         ]
-    #         response = self.llm_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-    #         responses.append(response)
-    #     return responses
-
     def _generate_responses_batch(self, queries: List[str], documents_batch: List[List[Dict]]) -> List[str]:
         """Step 6: Generate LLM responses for each query in the batch """
+        step_start = time.time()
         
         # Prepare all prompts at once
+        prompt_start = time.time()
         all_messages = []
         for query, documents in zip(queries, documents_batch):
             context = "\n".join([f"- {doc['title']}: {doc['content'][:200]}" for doc in documents])
@@ -268,8 +252,11 @@ class MonolithicPipeline:
             )
             for msgs in all_messages
         ]
+        prompt_time = time.time() - prompt_start
+        print(f"[Node {NODE_NUMBER}]   - Prompt preparation: {prompt_time:.4f}s")
         
         # Tokenize entire batch
+        tokenize_start = time.time()
         model_inputs = self.llm_tokenizer(
             texts, 
             return_tensors="pt",
@@ -277,8 +264,11 @@ class MonolithicPipeline:
             truncation=True,
             max_length=512
         ).to(self.device)
+        tokenize_time = time.time() - tokenize_start
+        print(f"[Node {NODE_NUMBER}]   - Tokenization: {tokenize_time:.4f}s")
         
         # Generate for entire batch at once
+        generation_start = time.time()
         with torch.inference_mode():  # Faster than no_grad
             generated_ids = self.llm_model.generate(
                 **model_inputs,
@@ -288,8 +278,11 @@ class MonolithicPipeline:
                 use_cache=True,  # Enable KV cache
                 do_sample=False,  # Greedy decoding is faster
             )
+        generation_time = time.time() - generation_start
+        print(f"[Node {NODE_NUMBER}]   - LLM generation: {generation_time:.4f}s")
         
         # Extract only new tokens
+        decode_start = time.time()
         generated_ids = [
             output_ids[len(input_ids):] 
             for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
@@ -297,12 +290,18 @@ class MonolithicPipeline:
         
         # Batch decode
         responses = self.llm_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+        decode_time = time.time() - decode_start
+        print(f"[Node {NODE_NUMBER}]   - Decoding: {decode_time:.4f}s")
+        
+        step_time = time.time() - step_start
+        print(f"[Node {NODE_NUMBER}] LLM response generation (total): {step_time:.4f}s (batch size: {len(queries)})")
         
         return responses
     
     # @profile
     def _analyze_sentiment_batch(self, texts: List[str]) -> List[str]:
         """Step 7: Analyze sentiment for each generated response (Node 2 only)"""
+        step_start = time.time()
         truncated_texts = [text[:CONFIG['truncate_length']] for text in texts]
         raw_results = self.sentiment_classifier(truncated_texts)
         sentiment_map = {
@@ -315,16 +314,21 @@ class MonolithicPipeline:
         sentiments = []
         for result in raw_results:
             sentiments.append(sentiment_map.get(result['label'], 'neutral'))
+        step_time = time.time() - step_start
+        print(f"[Node {NODE_NUMBER}] Sentiment analysis: {step_time:.4f}s (batch size: {len(texts)})")
         return sentiments
     
     # @profile
     def _filter_response_safety_batch(self, texts: List[str]) -> List[bool]:
         """Step 8: Filter responses for safety for each entry in the batch (Node 2 only)"""
+        step_start = time.time()
         truncated_texts = [text[:CONFIG['truncate_length']] for text in texts]
         raw_results = self.safety_classifier(truncated_texts)
         toxicity_flags = []
         for result in raw_results:
             toxicity_flags.append(result['score'] > 0.5)
+        step_time = time.time() - step_start
+        print(f"[Node {NODE_NUMBER}] Safety filtering: {step_time:.4f}s (batch size: {len(texts)})")
         return toxicity_flags
 
 
@@ -376,6 +380,7 @@ def process_requests_worker():
             # Node 0: orchestration, call node 1
             if NODE_NUMBER == 0:
                 # Step 1: call node 1 for embedding + FAISS search
+                node1_call_start = time.time()
                 node1_url = f"http://{NODE_1_IP}/process_stage"
                 try:
                     r1 = requests.post(node1_url, json={
@@ -387,6 +392,8 @@ def process_requests_worker():
                     #we change timeout to 300 here: full batch processing propagates through node 1
                     r1.raise_for_status()
                     node1_data = r1.json()
+                    node1_call_time = time.time() - node1_call_start
+                    print(f"[Node {NODE_NUMBER}] Node 1 call (embed+FAISS+fetch+rerank+LLM): {node1_call_time:.4f}s")
                 except Exception as e:
                     traceback.print_exc()
                     raise RuntimeError(f"Error calling Node 1 (embed+FAISS): {e}")
@@ -394,10 +401,14 @@ def process_requests_worker():
                 generated_text = node1_data['generations'] 
                 
                 # Step 3: node 0 local post-processing (sentiment and safety)
+                postprocess_start = time.time()
                 sentiments = pipeline._analyze_sentiment_batch(generated_text)
                 toxicity_flags = pipeline._filter_response_safety_batch(generated_text)
+                postprocess_time = time.time() - postprocess_start
+                print(f"[Node {NODE_NUMBER}] Post-processing (total): {postprocess_time:.4f}s")
                 
                 processing_time = time.time() - start
+                print(f"[Node {NODE_NUMBER}] === TOTAL BATCH PROCESSING TIME: {processing_time:.4f}s ===")
                 with results_lock:
                     for req, gen, snt, tox in zip(reqs, generated_text, sentiments, toxicity_flags):
                         response_payload = {
@@ -480,6 +491,7 @@ def process_stage():
             if NODE_NUMBER != 1:
                 return jsonify({"error": "embed_and_faiss stage only on node 1"}), 400
             
+            stage_start = time.time()
             queries = payload.get("queries", [])
             
             #embedding and FAISS
@@ -487,6 +499,7 @@ def process_stage():
             doc_ids = pipeline._faiss_search_batch(embeddings)
 
             #call node 2 for fetch + rerank + LLM
+            node2_call_start = time.time()
             node2_url = f"http://{NODE_2_IP}/process_stage"
             try:
                 r2 = requests.post(node2_url, json={
@@ -499,9 +512,14 @@ def process_stage():
                 r2.raise_for_status()
                 node2_data = r2.json()
                 generations = node2_data["responses"]
+                node2_call_time = time.time() - node2_call_start
+                print(f"[Node {NODE_NUMBER}] Node 2 call (fetch+rerank+LLM): {node2_call_time:.4f}s")
             except Exception as e:
                 traceback.print_exc()
                 raise RuntimeError(f"Error calling Node 2 (fetch+rerank+LLM): {e}")
+            
+            stage_time = time.time() - stage_start
+            print(f"[Node {NODE_NUMBER}] === NODE 1 TOTAL STAGE TIME: {stage_time:.4f}s ===")
             
             return jsonify({
                 "generations": generations  
@@ -512,12 +530,16 @@ def process_stage():
             if NODE_NUMBER != 2:
                 return jsonify({"error": "fetch_rerank_llm stage only on node 2"}), 400
             
+            stage_start = time.time()
             queries = payload.get("queries", [])
             doc_ids = payload.get("doc_ids", [])
             
             documents = pipeline._fetch_documents_batch(doc_ids)
             reranked = pipeline._rerank_documents_batch(queries, documents)
             responses = pipeline._generate_responses_batch(queries, reranked)
+            
+            stage_time = time.time() - stage_start
+            print(f"[Node {NODE_NUMBER}] === NODE 2 TOTAL STAGE TIME: {stage_time:.4f}s ===")
             
             return jsonify({
                 "responses": responses 
