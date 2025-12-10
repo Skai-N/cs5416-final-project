@@ -77,6 +77,8 @@ class MonolithicPipeline:
         print(f"[node {NODE_NUMBER}] FAISS index path: {CONFIG['faiss_index_path']}")
         print(f"[node {NODE_NUMBER}] Documents path: {CONFIG['documents_path']}")
 
+        self.global_batch_size = 1  # batch size for each stage of pipeline
+
         # Model names
         if NODE_NUMBER == 0:
             self.embedding_model_name = "BAAI/bge-base-en-v1.5"
@@ -305,26 +307,42 @@ def process_requests_worker():
             request_data = request_queue.get()
             if request_data is None:  # Shutdown signal
                 break
+            batch = [request_data]
 
+            batch_wait_start = time.time()
+            while len(batch) < pipeline.global_batch_size:
+                req_data = request_queue.get()
+                if req_data is not None:
+                    batch.append(req_data)
+                else:
+                    break
+                if (
+                    time.time() - batch_wait_start > 5
+                ):  # automatically send a batch after 5 seconds
+                    break
+
+            print(f"Processing batch of size ({len(batch)})")
+
+            batch_start = time.time()
             # Create request object
-            req = PipelineRequest(
-                request_id=request_data["request_id"],
-                query=request_data["query"],
-                timestamp=time.time(),
-            )
+            reqs = [
+                PipelineRequest(
+                    request_id=r["request_id"], query=r["query"], timestamp=batch_start
+                )
+                for r in batch
+            ]
 
             start = time.time()
 
             # node 0 will embed, then put embed in node 1 for fetch, rerank/llm/post in node 2
             if NODE_NUMBER == 0:
                 # 1- local embedding
-                emb = pipeline._generate_embeddings_batch([req.query])  # np array?
+                query_batch = [r.query for r in reqs]
+                emb = pipeline._generate_embeddings_batch(query_batch)  # np array?
                 emb_list = emb.astype("float32").tolist()
 
                 # 2 - call Node 1 for FAISS+fetch
-                node1_url = (
-                    f"http://{NODE_1_IP}/process_stage"  # TODO change port number
-                )
+                node1_url = f"http://{NODE_1_IP}/process_stage"
                 try:
                     r = requests.post(
                         node1_url,
@@ -340,15 +358,13 @@ def process_requests_worker():
                 documents = node1_data.get("documents", [[]])
 
                 # 3 - call Node 2 for rerank/llm/sent/safe
-                node2_url = (
-                    f"http://{NODE_2_IP}/process_stage"  # TODO change port number
-                )
+                node2_url = f"http://{NODE_2_IP}/process_stage"
                 try:
                     r2 = requests.post(
                         node2_url,
                         json={
                             "stage": "rerank_llm_sentiment_safety",
-                            "payload": {"queries": [req.query], "documents": documents},
+                            "payload": {"queries": query_batch, "documents": documents},
                         },
                         timeout=300,
                     )
@@ -358,23 +374,23 @@ def process_requests_worker():
                     traceback.print_exc()
                     raise RuntimeError(f"Error calling Node2 LLM: {e}")
 
-                generated = node2_data["responses"][0]
-                sentiment = node2_data["sentiments"][0]
-                toxicity = node2_data["toxicity"][0]
-                sensitivity_result = "true" if toxicity else "false"
+                generated = node2_data["responses"]
+                sentiment = node2_data["sentiments"]
+                toxicity = node2_data["toxicity"]
 
                 processing_time = time.time() - start
-                response_payload = {
-                    "request_id": req.request_id,
-                    "generated_response": generated,
-                    "sentiment": sentiment,
-                    "is_toxic": sensitivity_result,
-                    "processing_time": processing_time,
-                }
 
             # Store result
             with results_lock:
-                results[request_data["request_id"]] = response_payload
+                for req, gen, snt, tox in zip(reqs, generated, sentiment, toxicity):
+                    response_payload = {
+                        "request_id": req.request_id,
+                        "generated_response": gen,
+                        "sentiment": snt,
+                        "is_toxic": "true" if tox else "false",
+                        "processing_time": processing_time,
+                    }
+                    results[req.request_id] = response_payload
 
             request_queue.task_done()
         except Exception as e:
