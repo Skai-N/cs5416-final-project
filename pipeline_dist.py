@@ -1,3 +1,4 @@
+# Save this file and run on each host with NODE_NUMBER env var (0,1,2) and appropriate NODE_?_IP values.
 import os
 import gc
 import json
@@ -38,7 +39,7 @@ DOCUMENTS_DIR = os.environ.get('DOCUMENTS_DIR', 'documents/')
 
 # for pipeline testing:
 BATCH_TIMEOUT = int(os.environ.get('BATCH_TIMEOUT', 25))
-BATCH_MAX_SIZE = int(os.environ.get('BATCH_MAX_SIZE', 4))
+BATCH_MAX_SIZE = int(os.environ.get('BATCH_MAX_SIZE', 2))
 
 # Configuration
 CONFIG = {
@@ -72,9 +73,11 @@ class PipelineResponse:
     sentiment: str
     is_toxic: str
     processing_time: float
+    timing_breakdown: Dict[str, float] = None
 
 class MonolithicPipeline:
     def __init__(self):
+        # Use CPU by default; you can change to cuda if available and models/support that.
         self.device = torch.device('cpu')
         print(f"[node {NODE_NUMBER}] Initializing pipeline on {self.device}")
         print(f"[node {NODE_NUMBER}] FAISS index path: {CONFIG['faiss_index_path']}")
@@ -297,11 +300,12 @@ class MonolithicPipeline:
 pipeline = None
 
 def send_to_generation_node(node_url: str, sub_queries: List[str], sub_doc_ids: List[List[int]], 
-                             start_idx: int, end_idx: int) -> Tuple[int, int, List[str]]:
+                             start_idx: int, end_idx: int) -> Tuple[int, int, List[str], float, Dict]:
     """
     Helper function to send a sub-batch to a generation node.
-    Returns (start_idx, end_idx, responses) for result placement.
+    Returns (start_idx, end_idx, responses, elapsed_time, node_timing) for result placement.
     """
+    node_start = time.time()
     try:
         r = requests.post(node_url, json={
             "stage": "fetch_rerank_llm",
@@ -313,14 +317,20 @@ def send_to_generation_node(node_url: str, sub_queries: List[str], sub_doc_ids: 
         
         r.raise_for_status()
         node_data = r.json()
-        return (start_idx, end_idx, node_data["responses"])
+        elapsed = time.time() - node_start
+        
+        # Extract timing breakdown from node response
+        node_timing = node_data.get("timing_breakdown", {})
+        
+        return (start_idx, end_idx, node_data["responses"], elapsed, node_timing)
     
     except Exception as ex:
         print(f"[node {NODE_NUMBER}] Error contacting {node_url}: {ex}")
         traceback.print_exc()
         # Return error responses for this sub-batch
         error_responses = [f"Error generating response: {ex}"] * len(sub_queries)
-        return (start_idx, end_idx, error_responses)
+        elapsed = time.time() - node_start
+        return (start_idx, end_idx, error_responses, elapsed, {})
 
 def process_requests_worker():
     """Worker thread that processes requests from the queue on Node 0 (orchestration)."""
@@ -344,7 +354,9 @@ def process_requests_worker():
                 if req_data is None:
                     break
                 batch.append(req_data)
-            print(f"[node {NODE_NUMBER}] Processing batch of size ({len(batch)})")
+            
+            batch_wait_time = time.time() - batch_wait_start
+            print(f"[node {NODE_NUMBER}] Processing batch of size ({len(batch)}) - waited {batch_wait_time:.3f}s")
 
             batch_start = time.time()
             reqs = [
@@ -352,13 +364,34 @@ def process_requests_worker():
                 for r in batch
             ]
 
-            start = time.time()
+            # Initialize timing breakdown
+            timing_breakdown = {
+                'batch_wait_time': batch_wait_time,
+                'embedding_time': 0.0,
+                'faiss_search_time': 0.0,
+                'llm_generation_time': 0.0,
+                'node_times': {},
+                'sentiment_analysis_time': 0.0,
+                'safety_check_time': 0.0,
+            }
+
+            pipeline_start = time.time()
 
             # Node 0 orchestration flow:
             # 1) Embed & FAISS locally
             queries = [r.query for r in reqs]
+            
+            # Embedding step
+            t0 = time.time()
             embeddings = pipeline._generate_embeddings_batch(queries)
+            timing_breakdown['embedding_time'] = time.time() - t0
+            print(f"[node {NODE_NUMBER}] Embedding generation: {timing_breakdown['embedding_time']:.3f}s")
+            
+            # FAISS search step
+            t0 = time.time()
             doc_ids = pipeline._faiss_search_batch(embeddings)
+            timing_breakdown['faiss_search_time'] = time.time() - t0
+            print(f"[node {NODE_NUMBER}] FAISS search: {timing_breakdown['faiss_search_time']:.3f}s")
 
             # 2) Split batch between generation nodes for PARALLEL processing
             gen_nodes = [
@@ -370,7 +403,6 @@ def process_requests_worker():
             batch_size = len(queries)
 
             # Compute partition indices
-            # Example: for batch 7 → split like [3,4]
             splits = []
             base = batch_size // num_nodes
             remainder = batch_size % num_nodes
@@ -382,7 +414,8 @@ def process_requests_worker():
 
             responses_partial = [None] * batch_size
 
-            # Dispatch sub-batches to generation nodes IN PARALLEL using ThreadPoolExecutor
+            # Dispatch sub-batches to generation nodes IN PARALLEL
+            t0 = time.time()
             with ThreadPoolExecutor(max_workers=num_nodes) as executor:
                 futures = []
                 
@@ -403,26 +436,75 @@ def process_requests_worker():
                         s,
                         e
                     )
-                    futures.append(future)
+                    futures.append((future, node_url, node_idx))
                 
                 # Collect results as they complete
-                for future in as_completed(futures):
+                for future, node_url, node_idx in futures:
                     try:
-                        start_idx, end_idx, responses = future.result()
+                        start_idx, end_idx, responses, node_time, node_timing = future.result()
                         # Place responses in correct position
                         for i, resp in enumerate(responses):
                             responses_partial[start_idx + i] = resp
+                        
+                        # Track individual node time and detailed breakdown
+                        node_key = f'node_{node_idx+1}'
+                        timing_breakdown['node_times'][node_key] = {
+                            'total_time': node_time,
+                            'breakdown': node_timing
+                        }
+                        print(f"[node {NODE_NUMBER}] Node {node_idx+1} completed in {node_time:.3f}s")
+                        if node_timing:
+                            print(f"  Breakdown: Fetch={node_timing.get('fetch_documents', 0):.3f}s, "
+                                  f"Rerank={node_timing.get('rerank_documents', 0):.3f}s, "
+                                  f"LLM={node_timing.get('llm_generation', 0):.3f}s")
                     except Exception as ex:
                         print(f"[node {NODE_NUMBER}] Error collecting future result: {ex}")
                         traceback.print_exc()
 
+            timing_breakdown['llm_generation_time'] = time.time() - t0
+            print(f"[node {NODE_NUMBER}] Parallel LLM generation (wall time): {timing_breakdown['llm_generation_time']:.3f}s")
+
             generations = responses_partial
 
             # 3) Postprocess locally (sentiment + safety)
+            t0 = time.time()
             sentiments = pipeline._analyze_sentiment_batch(generations)
+            timing_breakdown['sentiment_analysis_time'] = time.time() - t0
+            print(f"[node {NODE_NUMBER}] Sentiment analysis: {timing_breakdown['sentiment_analysis_time']:.3f}s")
+            
+            t0 = time.time()
             toxicity_flags = pipeline._filter_response_safety_batch(generations)
+            timing_breakdown['safety_check_time'] = time.time() - t0
+            print(f"[node {NODE_NUMBER}] Safety check: {timing_breakdown['safety_check_time']:.3f}s")
 
-            processing_time = time.time() - start
+            total_processing_time = time.time() - pipeline_start
+            timing_breakdown['total_processing_time'] = total_processing_time
+            
+            # Print comprehensive timing summary
+            print(f"\n{'='*60}")
+            print(f"[node {NODE_NUMBER}] PIPELINE TIMING SUMMARY (batch size: {len(batch)})")
+            print(f"{'='*60}")
+            print(f"Batch wait time:      {timing_breakdown['batch_wait_time']:>8.3f}s")
+            print(f"Embedding generation: {timing_breakdown['embedding_time']:>8.3f}s")
+            print(f"FAISS search:         {timing_breakdown['faiss_search_time']:>8.3f}s")
+            print(f"LLM generation:       {timing_breakdown['llm_generation_time']:>8.3f}s (parallel wall time)")
+            
+            # Show individual node times
+            for node_key, node_data in timing_breakdown['node_times'].items():
+                if isinstance(node_data, dict):
+                    print(f"  └─ {node_key}:         {node_data['total_time']:>8.3f}s")
+                    breakdown = node_data.get('breakdown', {})
+                    if breakdown:
+                        print(f"       ├─ Fetch:       {breakdown.get('fetch_documents', 0):>8.3f}s")
+                        print(f"       ├─ Rerank:      {breakdown.get('rerank_documents', 0):>8.3f}s")
+                        print(f"       └─ LLM gen:     {breakdown.get('llm_generation', 0):>8.3f}s")
+            
+            print(f"Sentiment analysis:   {timing_breakdown['sentiment_analysis_time']:>8.3f}s")
+            print(f"Safety check:         {timing_breakdown['safety_check_time']:>8.3f}s")
+            print(f"{'-'*60}")
+            print(f"TOTAL:                {total_processing_time:>8.3f}s")
+            print(f"{'='*60}\n")
+            
             with results_lock:
                 for req, gen, snt, tox in zip(reqs, generations, sentiments, toxicity_flags):
                     response_payload = {
@@ -430,7 +512,8 @@ def process_requests_worker():
                         "generated_response": gen,
                         "sentiment": snt,
                         "is_toxic": "true" if tox else "false",
-                        "processing_time": processing_time,
+                        "processing_time": total_processing_time,
+                        "timing_breakdown": timing_breakdown.copy()
                     }
                     results[req.request_id] = response_payload
 
@@ -506,15 +589,38 @@ def process_stage():
             if NODE_NUMBER not in (1, 2):
                 return jsonify({"error": "fetch_rerank_llm stage only on node 1 or 2"}), 400
 
+            stage_start = time.time()
+            timing_breakdown = {}
+
             queries = payload.get("queries", [])
             doc_ids = payload.get("doc_ids", [])
 
+            # Fetch documents
+            t0 = time.time()
             documents = pipeline._fetch_documents_batch(doc_ids)
+            timing_breakdown['fetch_documents'] = time.time() - t0
+            
+            # Rerank documents
+            t0 = time.time()
             reranked = pipeline._rerank_documents_batch(queries, documents)
+            timing_breakdown['rerank_documents'] = time.time() - t0
+            
+            # Generate responses with LLM
+            t0 = time.time()
             responses = pipeline._generate_responses_batch(queries, reranked)
+            timing_breakdown['llm_generation'] = time.time() - t0
+            
+            timing_breakdown['total'] = time.time() - stage_start
+
+            print(f"[node {NODE_NUMBER}] Stage timing for {len(queries)} queries:")
+            print(f"  - Fetch: {timing_breakdown['fetch_documents']:.3f}s")
+            print(f"  - Rerank: {timing_breakdown['rerank_documents']:.3f}s")
+            print(f"  - LLM: {timing_breakdown['llm_generation']:.3f}s")
+            print(f"  - Total: {timing_breakdown['total']:.3f}s")
 
             return jsonify({
-                "responses": responses
+                "responses": responses,
+                "timing_breakdown": timing_breakdown
             })
 
         return jsonify({"error": "unknown stage"}), 400
