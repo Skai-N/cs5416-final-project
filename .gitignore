@@ -3,3 +3,5 @@ documents/
 .venv/
 __pycache__/
 test.py
+client.sh
+robin_run.sh

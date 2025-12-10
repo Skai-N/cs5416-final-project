@@ -19,6 +19,7 @@ import warnings
 from sentence_transformers import SentenceTransformer
 from flask import Flask, request, jsonify
 from queue import Queue
+import queue
 import threading
 import traceback
 import requests
@@ -77,7 +78,7 @@ class MonolithicPipeline:
         print(f"[node {NODE_NUMBER}] FAISS index path: {CONFIG['faiss_index_path']}")
         print(f"[node {NODE_NUMBER}] Documents path: {CONFIG['documents_path']}")
 
-        self.global_batch_size = 1  # batch size for each stage of pipeline
+        self.global_batch_size = 16  # batch size for each stage of pipeline
 
         # Model names
         if NODE_NUMBER == 0:
@@ -309,18 +310,22 @@ def process_requests_worker():
                 break
             batch = [request_data]
 
+            BATCH_TIMEOUT = (
+                5  # automatically send batches out every 5 seconds if batch not full
+            )
             batch_wait_start = time.time()
             while len(batch) < pipeline.global_batch_size:
-                req_data = request_queue.get()
-                if req_data is not None:
-                    batch.append(req_data)
-                else:
-                    break
-                if (
-                    time.time() - batch_wait_start > 5
-                ):  # automatically send a batch after 5 seconds
-                    break
+                remaining = BATCH_TIMEOUT - (time.time() - batch_wait_start)
 
+                if remaining < 0:
+                    break
+                try:
+                    req_data = request_queue.get(timeout=remaining)
+                except queue.Empty:
+                    break
+                if req_data is None:
+                    break
+                batch.append(req_data)
             print(f"Processing batch of size ({len(batch)})")
 
             batch_start = time.time()
@@ -392,11 +397,13 @@ def process_requests_worker():
                     }
                     results[req.request_id] = response_payload
 
-            request_queue.task_done()
+            for _ in batch:
+                request_queue.task_done()
         except Exception as e:
             print(f"[node {NODE_NUMBER}] Error in worker: {e}")
             traceback.print_exc()
-            request_queue.task_done()
+            for _ in batch:
+                request_queue.task_done()
 
 
 @app.route("/query", methods=["POST"])

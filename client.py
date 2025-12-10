@@ -118,11 +118,12 @@ def main():
     Main function: sends requests every 10 seconds for 1 minute
     Requests are sent at fixed intervals regardless of response time
     """
+    num_requests = 20
     print("=" * 70)
     print("ML INFERENCE PIPELINE CLIENT")
     print("=" * 70)
     print(f"Server URL: {SERVER_URL}")
-    print(f"Sending 6 requests")
+    print(f"Sending {num_requests} requests")
     print("=" * 70)
 
     # Check if server is healthy
@@ -139,7 +140,7 @@ def main():
     threads = []
 
     # Send 6 requests at 10-second intervals
-    for i in range(6):
+    for i in range(num_requests):
         # Calculate when this request should be sent
         target_send_time = start_time + (i)
 
@@ -176,7 +177,7 @@ def main():
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)
-    print(f"Total requests sent: 6")
+    print(f"Total requests sent: {num_requests}")
 
     with results_lock:
         successful = sum(1 for r in results.values() if r.get("success", False))
@@ -217,4 +218,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
