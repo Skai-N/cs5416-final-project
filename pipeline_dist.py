@@ -18,12 +18,16 @@ from transformers import pipeline as hf_pipeline
 import warnings
 from sentence_transformers import SentenceTransformer
 from flask import Flask, request, jsonify
+import queue
 from queue import Queue
 import threading
 import traceback
 import requests
 from flask_compress import Compress
 from memory_profiler import profile
+
+warnings.filterwarnings("ignore")
+
 
 # Read environment variables
 TOTAL_NODES = int(os.environ.get('TOTAL_NODES', 1))
@@ -34,6 +38,10 @@ NODE_2_IP = os.environ.get('NODE_2_IP', 'localhost:8002')
 FAISS_INDEX_PATH = os.environ.get('FAISS_INDEX_PATH', 'faiss_index.bin')
 DOCUMENTS_DIR = os.environ.get('DOCUMENTS_DIR', 'documents/')
 
+#for pipeline testing:
+BATCH_TIMEOUT = int(os.environ.get('BATCH_TIMEOUT', 20))
+BATCH_MAX_SIZE = int(os.environ.get('BATCH_MAX_SIZE', 4))
+
 # Configuration
 CONFIG = {
     'faiss_index_path': FAISS_INDEX_PATH,
@@ -41,7 +49,7 @@ CONFIG = {
     'faiss_dim': 768,
     'max_tokens': 128,
     'retrieval_k': 10,
-    'truncate_length': 512
+    'truncate_length': 512,
 }
 
 # Flask app
@@ -76,6 +84,9 @@ class MonolithicPipeline:
         print(f"[node {NODE_NUMBER}] FAISS index path: {CONFIG['faiss_index_path']}")
         print(f"[node {NODE_NUMBER}] Documents path: {CONFIG['documents_path']}")
         
+        self.global_batch_size = BATCH_MAX_SIZE
+
+
         # Initialize only the models needed for this node
         if NODE_NUMBER == 0:
             print("[Node 0] Loading postprocessing models")
@@ -137,7 +148,7 @@ class MonolithicPipeline:
 
             self.db_path = f"{CONFIG['documents_path']}/documents.db"
             self.db_conn = sqlite3.connect(self.db_path, check_same_thread=False)
-    @profile
+    # @profile
     def _generate_embeddings_batch(self, texts: List[str]) -> np.ndarray:
         """Step 2: Generate embeddings for a batch of queries """
         embeddings = self.embedding_model.encode(
@@ -147,14 +158,14 @@ class MonolithicPipeline:
         )
         return embeddings
     
-    @profile
+    # @profile
     def _faiss_search_batch(self, query_embeddings: np.ndarray) -> List[List[int]]:
         """Step 3: Perform FAISS ANN search for a batch of embeddings """
         query_embeddings = query_embeddings.astype('float32')
         _, indices = self.index.search(query_embeddings, CONFIG['retrieval_k'])
         return [row.tolist() for row in indices]
     
-    @profile
+    # @profile
     def _fetch_documents_batch(self, doc_id_batches: List[List[int]]) -> List[List[Dict]]:
         """Step 4: Fetch documents for each query in the batch using SQLite """
         cursor = self.db_conn.cursor()
@@ -177,7 +188,7 @@ class MonolithicPipeline:
             documents_batch.append(documents)
         return documents_batch
     
-    @profile
+    # @profile
     def _rerank_documents_batch(self, queries: List[str], documents_batch: List[List[Dict]]) -> List[List[Dict]]:
         """Step 5: Rerank retrieved documents for each query in the batch"""
         reranked_batches = []
@@ -200,40 +211,96 @@ class MonolithicPipeline:
             reranked_batches.append([doc for doc, _ in doc_scores])
         return reranked_batches
     
-    @profile
+    # @profile
+    # def _generate_responses_batch(self, queries: List[str], documents_batch: List[List[Dict]]) -> List[str]:
+    #     """Step 6: Generate LLM responses for each query in the batch (Node 2 only)"""
+    #     responses = []
+    #     for query, documents in zip(queries, documents_batch):
+    #         context = "\n".join([f"- {doc['title']}: {doc['content'][:200]}" for doc in documents[:3]])
+    #         messages = [
+    #             {"role": "system",
+    #              "content": "When given Context and Question, reply as 'Answer: <final answer>' only."},
+    #             {"role": "user",
+    #              "content": f"Context:\n{context}\n\nQuestion: {query}\n\nAnswer:"}
+    #         ]
+            
+    #         text = self.llm_tokenizer.apply_chat_template(
+    #             messages,
+    #             tokenize=False,
+    #             add_generation_prompt=True
+    #         )
+
+    #         model_inputs = self.llm_tokenizer([text], return_tensors="pt").to(self.device)
+    #         generated_ids = self.llm_model.generate(
+    #             **model_inputs,
+    #             max_new_tokens=CONFIG['max_tokens'],
+    #             temperature=0.01,
+    #             pad_token_id=self.llm_tokenizer.eos_token_id
+    #         )
+    #         generated_ids = [
+    #             output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+    #         ]
+    #         response = self.llm_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    #         responses.append(response)
+    #     return responses
+
     def _generate_responses_batch(self, queries: List[str], documents_batch: List[List[Dict]]) -> List[str]:
-        """Step 6: Generate LLM responses for each query in the batch (Node 2 only)"""
-        responses = []
+        """Step 6: Generate LLM responses for each query in the batch """
+        
+        # Prepare all prompts at once
+        all_messages = []
         for query, documents in zip(queries, documents_batch):
-            context = "\n".join([f"- {doc['title']}: {doc['content'][:200]}" for doc in documents[:3]])
+            context = "\n".join([f"- {doc['title']}: {doc['content'][:200]}" for doc in documents])
             messages = [
                 {"role": "system",
-                 "content": "When given Context and Question, reply as 'Answer: <final answer>' only."},
+                "content": "When given Context and Question, reply as 'Answer: <final answer>' only."},
                 {"role": "user",
-                 "content": f"Context:\n{context}\n\nQuestion: {query}\n\nAnswer:"}
+                "content": f"Context:\n{context}\n\nQuestion: {query}\n\nAnswer:"}
             ]
-            
-            text = self.llm_tokenizer.apply_chat_template(
-                messages,
+            all_messages.append(messages)
+        
+        # Apply chat template to all at once
+        texts = [
+            self.llm_tokenizer.apply_chat_template(
+                msgs,
                 tokenize=False,
                 add_generation_prompt=True
             )
-
-            model_inputs = self.llm_tokenizer([text], return_tensors="pt").to(self.device)
+            for msgs in all_messages
+        ]
+        
+        # Tokenize entire batch
+        model_inputs = self.llm_tokenizer(
+            texts, 
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=512
+        ).to(self.device)
+        
+        # Generate for entire batch at once
+        with torch.inference_mode():  # Faster than no_grad
             generated_ids = self.llm_model.generate(
                 **model_inputs,
                 max_new_tokens=CONFIG['max_tokens'],
                 temperature=0.01,
-                pad_token_id=self.llm_tokenizer.eos_token_id
+                pad_token_id=self.llm_tokenizer.eos_token_id,
+                use_cache=True,  # Enable KV cache
+                do_sample=False,  # Greedy decoding is faster
             )
-            generated_ids = [
-                output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
-            ]
-            response = self.llm_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-            responses.append(response)
+        
+        # Extract only new tokens
+        generated_ids = [
+            output_ids[len(input_ids):] 
+            for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+        ]
+        
+        # Batch decode
+        responses = self.llm_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+        
         return responses
     
-    @profile
+    # @profile
     def _analyze_sentiment_batch(self, texts: List[str]) -> List[str]:
         """Step 7: Analyze sentiment for each generated response (Node 2 only)"""
         truncated_texts = [text[:CONFIG['truncate_length']] for text in texts]
@@ -250,7 +317,7 @@ class MonolithicPipeline:
             sentiments.append(sentiment_map.get(result['label'], 'neutral'))
         return sentiments
     
-    @profile
+    # @profile
     def _filter_response_safety_batch(self, texts: List[str]) -> List[bool]:
         """Step 8: Filter responses for safety for each entry in the batch (Node 2 only)"""
         truncated_texts = [text[:CONFIG['truncate_length']] for text in texts]
@@ -264,9 +331,11 @@ class MonolithicPipeline:
 # Global pipeline instance 
 pipeline = None
 
+
+
 def process_requests_worker():
-    """
-    Worker thread that processes requests from the queue (Node 0), then dist work.
+    """Worker thread that processes requests from the queue.
+    If we're on Node 0 it will distribute across the other 2 nodes
     """
     global pipeline
     while True:
@@ -274,16 +343,36 @@ def process_requests_worker():
             request_data = request_queue.get()
             if request_data is None:  # Shutdown signal
                 break
+            batch = [request_data]
 
+            
+            batch_wait_start = time.time()
+            while len(batch) < pipeline.global_batch_size:
+                remaining = BATCH_TIMEOUT - (time.time() - batch_wait_start)
+
+                if remaining < 0:
+                    break
+                try:
+                    req_data = request_queue.get(timeout=remaining)
+                except queue.Empty:
+                    break
+                if req_data is None:
+                    break
+                batch.append(req_data)
+            print(f"Processing batch of size ({len(batch)})")
+
+            batch_start = time.time()
             # Create request object
-            req = PipelineRequest(
-                request_id=request_data['request_id'],
-                query=request_data['query'],
-                timestamp=time.time()
-            )
+            reqs = [
+                PipelineRequest(
+                    request_id=r["request_id"], query=r["query"], timestamp=batch_start
+                )
+                for r in batch
+            ]
 
             start = time.time()
 
+            # node 0 will embed, then put embed in node 1 for fetch, rerank/llm/post in node 2
             # Node 0: orchestration, call node 1
             if NODE_NUMBER == 0:
                 # Step 1: call node 1 for embedding + FAISS search
@@ -292,42 +381,41 @@ def process_requests_worker():
                     r1 = requests.post(node1_url, json={
                         "stage": "embed_and_faiss",
                         "payload": {
-                            "queries": [req.query]
+                            "queries": [r.query for r in reqs]
                         }
-                    }, timeout=120)
+                    }, timeout=300)
+                    #we change timeout to 300 here: full batch processing propagates through node 1
                     r1.raise_for_status()
                     node1_data = r1.json()
                 except Exception as e:
                     traceback.print_exc()
                     raise RuntimeError(f"Error calling Node 1 (embed+FAISS): {e}")
 
-                generated_text = node1_data['generation']
+                generated_text = node1_data['generations'] 
                 
                 # Step 3: node 0 local post-processing (sentiment and safety)
-                sentiments = pipeline._analyze_sentiment_batch([generated_text])
-                toxicity_flags = pipeline._filter_response_safety_batch([generated_text])
+                sentiments = pipeline._analyze_sentiment_batch(generated_text)
+                toxicity_flags = pipeline._filter_response_safety_batch(generated_text)
                 
-                sentiment = sentiments[0]
-                is_toxic = "true" if toxicity_flags[0] else "false"
-
                 processing_time = time.time() - start
-                response_payload = {
-                    'request_id': req.request_id,
-                    'generated_response': generated_text,
-                    'sentiment': sentiment,
-                    'is_toxic': is_toxic,
-                    'processing_time': processing_time
-                }
-
-                # Store result
                 with results_lock:
-                    results[request_data['request_id']] = response_payload
+                    for req, gen, snt, tox in zip(reqs, generated_text, sentiments, toxicity_flags):
+                        response_payload = {
+                            "request_id": req.request_id,
+                            "generated_response": gen,
+                            "sentiment": snt,
+                            "is_toxic": "true" if tox else "false",
+                            "processing_time": processing_time,
+                        }
+                        results[req.request_id] = response_payload
 
-            request_queue.task_done()
+            for _ in batch:
+                request_queue.task_done()
         except Exception as e:
             print(f"[node {NODE_NUMBER}] Error in worker: {e}")
             traceback.print_exc()
-            request_queue.task_done()
+            for _ in batch:
+                request_queue.task_done()
 
 @app.route('/query', methods=['POST'])
 def handle_query():
@@ -410,13 +498,13 @@ def process_stage():
                 }, timeout=300)
                 r2.raise_for_status()
                 node2_data = r2.json()
-                generated_text = node2_data["responses"][0]
+                generations = node2_data["responses"]
             except Exception as e:
                 traceback.print_exc()
                 raise RuntimeError(f"Error calling Node 2 (fetch+rerank+LLM): {e}")
             
             return jsonify({
-                "generation": generated_text  
+                "generations": generations  
             })
 
         # Node 2: fetch + rerank + LLM
