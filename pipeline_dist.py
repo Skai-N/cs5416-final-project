@@ -74,43 +74,81 @@ class MonolithicPipeline:
         print(f"[node {NODE_NUMBER}] FAISS index path: {CONFIG['faiss_index_path']}")
         print(f"[node {NODE_NUMBER}] Documents path: {CONFIG['documents_path']}")
         
-        # Model names
-        self.embedding_model_name = 'BAAI/bge-base-en-v1.5'
-        self.reranker_model_name = 'BAAI/bge-reranker-base'
-        self.llm_model_name = 'Qwen/Qwen2.5-0.5B-Instruct'
-        self.sentiment_model_name = 'nlptown/bert-base-multilingual-uncased-sentiment'
-        self.safety_model_name = 'unitary/toxic-bert'
+        # Initialize only the models needed for this node
+        if NODE_NUMBER == 0:
+            print("[Node 0] Loading embedding model...")
+            self.embedding_model_name = "BAAI/bge-base-en-v1.5"
+            self.embedding_model = SentenceTransformer(self.embedding_model_name).to(self.device)
+            print("[Node 0] Embedding model loaded!")
+            
+        elif NODE_NUMBER == 1:
+            print("[Node 1] Loading FAISS index and database...")
+            self.index = faiss.read_index(CONFIG["faiss_index_path"])
+            self.db_path = f"{CONFIG['documents_path']}/documents.db"
+            self.db_conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            print("[Node 1] FAISS index and database loaded!")
+
+        elif NODE_NUMBER == 2:
+            print("[Node 2] Loading all downstream models...")
+            self.reranker_model_name = "BAAI/bge-reranker-base"
+            self.llm_model_name = "Qwen/Qwen2.5-0.5B-Instruct"
+            self.sentiment_model_name = "nlptown/bert-base-multilingual-uncased-sentiment"
+            self.safety_model_name = "unitary/toxic-bert"
+
+            # Initialize reranker model/tokenizer
+            print("[Node 2]   Loading reranker...")
+            self.reranker_tokenizer = AutoTokenizer.from_pretrained(self.reranker_model_name)
+            self.reranker_model = AutoModelForSequenceClassification.from_pretrained(
+                self.reranker_model_name
+            ).to(self.device)
+            self.reranker_model.eval()
+
+            # Initialize LLM model/tokenizer
+            print("[Node 2]   Loading LLM...")
+            self.llm_model = AutoModelForCausalLM.from_pretrained(
+                self.llm_model_name, torch_dtype=torch.float16
+            ).to(self.device)
+            self.llm_tokenizer = AutoTokenizer.from_pretrained(self.llm_model_name)
+            self.llm_model.eval()
+
+            # Initialize sentiment analysis model
+            print("[Node 2]   Loading sentiment classifier...")
+            self.sentiment_classifier = hf_pipeline(
+                "sentiment-analysis",
+                model=self.sentiment_model_name,
+                device=self.device,
+            )
+
+            # Initialize safety model
+            print("[Node 2]   Loading safety classifier...")
+            self.safety_classifier = hf_pipeline(
+                "text-classification", 
+                model=self.safety_model_name, 
+                device=self.device
+            )
+            print("[Node 2] All models loaded!")
+
     @profile
     def _generate_embeddings_batch(self, texts: List[str]) -> np.ndarray:
-        """Step 2: Generate embeddings for a batch of queries"""
-        model = SentenceTransformer(self.embedding_model_name).to(self.device)
-        embeddings = model.encode(
+        """Step 2: Generate embeddings for a batch of queries (Node 0 only)"""
+        embeddings = self.embedding_model.encode(
             texts,
             normalize_embeddings=True,
             convert_to_numpy=True
         )
-        del model
-        gc.collect()
         return embeddings
+    
     @profile
     def _faiss_search_batch(self, query_embeddings: np.ndarray) -> List[List[int]]:
-        """Step 3: Perform FAISS ANN search for a batch of embeddings"""
-        if not os.path.exists(CONFIG['faiss_index_path']):
-            raise FileNotFoundError("FAISS index not found. Please create the index before running the pipeline.")
-        
-        print("Loading FAISS index")
-        index = faiss.read_index(CONFIG['faiss_index_path'])
+        """Step 3: Perform FAISS ANN search for a batch of embeddings (Node 1 only)"""
         query_embeddings = query_embeddings.astype('float32')
-        _, indices = index.search(query_embeddings, CONFIG['retrieval_k'])
-        del index
-        gc.collect()
+        _, indices = self.index.search(query_embeddings, CONFIG['retrieval_k'])
         return [row.tolist() for row in indices]
+    
     @profile
     def _fetch_documents_batch(self, doc_id_batches: List[List[int]]) -> List[List[Dict]]:
-        """Step 4: Fetch documents for each query in the batch using SQLite"""
-        db_path = f"{CONFIG['documents_path']}/documents.db"
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
+        """Step 4: Fetch documents for each query in the batch using SQLite (Node 1 only)"""
+        cursor = self.db_conn.cursor()
         documents_batch = []
         for doc_ids in doc_id_batches:
             documents = []
@@ -128,14 +166,11 @@ class MonolithicPipeline:
                         'category': result[3]
                     })
             documents_batch.append(documents)
-        conn.close()
         return documents_batch
+    
     @profile
     def _rerank_documents_batch(self, queries: List[str], documents_batch: List[List[Dict]]) -> List[List[Dict]]:
-        """Step 5: Rerank retrieved documents for each query in the batch"""
-        tokenizer = AutoTokenizer.from_pretrained(self.reranker_model_name)
-        model = AutoModelForSequenceClassification.from_pretrained(self.reranker_model_name).to(self.device)
-        model.eval()
+        """Step 5: Rerank retrieved documents for each query in the batch (Node 2 only)"""
         reranked_batches = []
         for query, documents in zip(queries, documents_batch):
             if not documents:
@@ -143,29 +178,22 @@ class MonolithicPipeline:
                 continue
             pairs = [[query, doc['content']] for doc in documents]
             with torch.no_grad():
-                inputs = tokenizer(
+                inputs = self.reranker_tokenizer(
                     pairs,
                     padding=True,
                     truncation=True,
                     return_tensors='pt',
                     max_length=CONFIG['truncate_length']
                 ).to(self.device)
-                scores = model(**inputs, return_dict=True).logits.view(-1, ).float()
+                scores = self.reranker_model(**inputs, return_dict=True).logits.view(-1, ).float()
             doc_scores = list(zip(documents, scores))
             doc_scores.sort(key=lambda x: x[1], reverse=True)
             reranked_batches.append([doc for doc, _ in doc_scores])
-        del model, tokenizer
-        gc.collect()
         return reranked_batches
+    
     @profile
     def _generate_responses_batch(self, queries: List[str], documents_batch: List[List[Dict]]) -> List[str]:
-        """Step 6: Generate LLM responses for each query in the batch"""
-
-        model = AutoModelForCausalLM.from_pretrained(
-            self.llm_model_name,
-            torch_dtype=torch.float16
-        ).to(self.device)
-        tokenizer = AutoTokenizer.from_pretrained(self.llm_model_name)
+        """Step 6: Generate LLM responses for each query in the batch (Node 2 only)"""
         responses = []
         for query, documents in zip(queries, documents_batch):
             context = "\n".join([f"- {doc['title']}: {doc['content'][:200]}" for doc in documents[:3]])
@@ -176,38 +204,31 @@ class MonolithicPipeline:
                  "content": f"Context:\n{context}\n\nQuestion: {query}\n\nAnswer:"}
             ]
             
-            text = tokenizer.apply_chat_template(
+            text = self.llm_tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
                 add_generation_prompt=True
             )
 
-            model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
-            generated_ids = model.generate(
+            model_inputs = self.llm_tokenizer([text], return_tensors="pt").to(self.device)
+            generated_ids = self.llm_model.generate(
                 **model_inputs,
                 max_new_tokens=CONFIG['max_tokens'],
                 temperature=0.01,
-                pad_token_id=tokenizer.eos_token_id
+                pad_token_id=self.llm_tokenizer.eos_token_id
             )
             generated_ids = [
                 output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
             ]
-            response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            response = self.llm_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
             responses.append(response)
-        del model, tokenizer
-        gc.collect()
         return responses
+    
     @profile
     def _analyze_sentiment_batch(self, texts: List[str]) -> List[str]:
-        """Step 7: Analyze sentiment for each generated response"""
-
-        classifier = hf_pipeline(
-            "sentiment-analysis",
-            model=self.sentiment_model_name,
-            device=self.device
-        )
+        """Step 7: Analyze sentiment for each generated response (Node 2 only)"""
         truncated_texts = [text[:CONFIG['truncate_length']] for text in texts]
-        raw_results = classifier(truncated_texts)
+        raw_results = self.sentiment_classifier(truncated_texts)
         sentiment_map = {
             '1 star': 'very negative',
             '2 stars': 'negative',
@@ -218,39 +239,31 @@ class MonolithicPipeline:
         sentiments = []
         for result in raw_results:
             sentiments.append(sentiment_map.get(result['label'], 'neutral'))
-        del classifier
-        gc.collect()
         return sentiments
+    
     @profile
     def _filter_response_safety_batch(self, texts: List[str]) -> List[bool]:
-        """Step 8: Filter responses for safety for each entry in the batch"""
-
-        classifier = hf_pipeline(
-            "text-classification",
-            model=self.safety_model_name,
-            device=self.device
-        )
+        """Step 8: Filter responses for safety for each entry in the batch (Node 2 only)"""
         truncated_texts = [text[:CONFIG['truncate_length']] for text in texts]
-        raw_results = classifier(truncated_texts)
+        raw_results = self.safety_classifier(truncated_texts)
         toxicity_flags = []
         for result in raw_results:
             toxicity_flags.append(result['score'] > 0.5)
-        del classifier
-        gc.collect()
         return toxicity_flags
+
 
 # Global pipeline instance 
 pipeline = None
 
 def process_requests_worker():
     """Worker thread that processes requests from the queue.
-       If we're on Node 0 it will distribute across the other 2 nodes
+       Node 0 orchestrates: embeds locally, then calls Node 1
     """
     global pipeline
     while True:
         try:
             request_data = request_queue.get()
-            if request_data is None: # Shutdown signal
+            if request_data is None:  # Shutdown signal
                 break
 
             # Create request object
@@ -262,19 +275,21 @@ def process_requests_worker():
 
             start = time.time()
 
-
-            #node 0 will embed, then put embed in node 1 for fetch, rerank/llm/post in node 2
+            # Node 0: embed, then call Node 1 for rest of pipeline
             if NODE_NUMBER == 0:
-                # 1- local embedding
-                emb = pipeline._generate_embeddings_batch([req.query])  # np array?
+                # 1 - Local embedding
+                emb = pipeline._generate_embeddings_batch([req.query])
                 emb_list = emb.astype('float32').tolist()
 
-                # 2 - call Node 1 for FAISS+fetch
+                # 2 - Call Node 1 for FAISS + fetch + (Node 1 will call Node 2)
                 node1_url = f"http://{NODE_1_IP}/process_stage"
                 try:
                     r = requests.post(node1_url, json={
                         "stage": "faiss_and_fetch",
-                        "payload": emb_list
+                        "payload": {
+                            "embeddings": emb_list, 
+                            "queries": [req.query]
+                        }
                     }, timeout=120)
                     r.raise_for_status()
                     node1_data = r.json()
@@ -282,27 +297,10 @@ def process_requests_worker():
                     traceback.print_exc()
                     raise RuntimeError(f"Error calling Node1 FAISS: {e}")
 
-                documents = node1_data.get("documents", [[]])
-
-                # 3 - call Node 2 for rerank/llm/sent/safe
-                node2_url = f"http://{NODE_2_IP}/process_stage"
-                try:
-                    r2 = requests.post(node2_url, json={
-                        "stage": "rerank_llm_sentiment_safety",
-                        "payload": {
-                            "queries": [req.query],
-                            "documents": documents
-                        }
-                    }, timeout=300)
-                    r2.raise_for_status()
-                    node2_data = r2.json()
-                except Exception as e:
-                    traceback.print_exc()
-                    raise RuntimeError(f"Error calling Node2 LLM: {e}")
-
-                generated = node2_data["responses"][0]
-                sentiment = node2_data["sentiments"][0]
-                toxicity = node2_data["toxicity"][0]
+                # 3 - Node 1 has called Node 2 and returned final results
+                generated = node1_data["generated"]
+                sentiment = node1_data["sentiment"]
+                toxicity = node1_data["toxicity"]
                 sensitivity_result = "true" if toxicity else "false"
 
                 processing_time = time.time() - start
@@ -314,9 +312,9 @@ def process_requests_worker():
                     'processing_time': processing_time
                 }
 
-            #Store result
-            with results_lock:
-                results[request_data['request_id']] = response_payload
+                # Store result
+                with results_lock:
+                    results[request_data['request_id']] = response_payload
 
             request_queue.task_done()
         except Exception as e:
@@ -343,21 +341,21 @@ def handle_query():
             if request_id in results:
                 return jsonify(results.pop(request_id)), 200
 
-        print(f"queueing request {request_id}")
+        print(f"Queueing request {request_id}")
         # Add to queue
         request_queue.put({
             'request_id': request_id,
             'query': query
         })
 
-        # Wait for processing (with timeout). Very inefficient - would suggest using a more efficient waiting and timeout mechanism.
-        timeout = 300 #5 minutes
+        # Wait for processing (with timeout)
+        timeout = 300  # 300 5 minutes
         start_wait = time.time()
         while True:
             with results_lock:
                 if request_id in results:
                     result = results.pop(request_id)
-                    return jsonify(result),200
+                    return jsonify(result), 200
 
             if time.time() - start_wait > timeout:
                 return jsonify({'error': 'Request timeout'}), 504
@@ -371,46 +369,66 @@ def handle_query():
 @app.route('/process_stage', methods=['POST'])
 def process_stage():
     """
-        Main pipeline execution for a batch of requests.
-        Expects JSON: {"stage": <stage_name>, "payload": <payload>}
-        Stages:
-        - Node1: "faiss_and_fetch" (input: embedding list) -> {"documents": [...]}
-        - Node2: "rerank_llm_sentiment_safety" (input: {"queries": [...], "documents": [...]}) -> {"responses": [...], "sentiments": [...], "toxicity": [...]}
-        Node0 also exposes a local embed stage if needed.
+    Process pipeline stages for inter-node communication.
+    
+    Stages:
+    - Node 1: "faiss_and_fetch" -> calls Node 2 and returns final results
+    - Node 2: "rerank_llm_sentiment_safety" -> returns final analysis
     """
     try:
         data = request.json
         stage = data.get("stage")
         payload = data.get("payload")
 
-        # Node 0 embeds
-        if stage == "embed":
-            if NODE_NUMBER != 0:
-                return jsonify({"error": "embed stage only on node 0"}), 400
-            # payload = [text1, text2, ...]
-            emb = pipeline._generate_embeddings_batch(payload)
-            return jsonify({"emb": emb.astype('float32').tolist()})
-
-        #node 1 FAISS and fetches
+        # Node 1: FAISS search + document fetch, then call Node 2
         if stage == "faiss_and_fetch":
             if NODE_NUMBER != 1:
                 return jsonify({"error": "faiss_and_fetch stage only on node 1"}), 400
-            # payload is embedding list or list of lists
-            emb_arr = np.array(payload, dtype='float32')
+            
+            emb_list = payload.get("embeddings", [])
+            emb_arr = np.array(emb_list, dtype='float32')
+            queries = payload.get("queries", [])
+            
+            # Execute FAISS search and document retrieval
             doc_ids = pipeline._faiss_search_batch(emb_arr)
             documents = pipeline._fetch_documents_batch(doc_ids)
-            return jsonify({"documents": documents})
 
-        #node 2 rerank+ LLM + sentiment and safety 
+            # Call Node 2 for downstream processing
+            node2_url = f"http://{NODE_2_IP}/process_stage"
+            try:
+                r2 = requests.post(node2_url, json={
+                    "stage": "rerank_llm_sentiment_safety",
+                    "payload": {
+                        "queries": queries,
+                        "documents": documents
+                    }
+                }, timeout=300)
+                r2.raise_for_status()
+                node2_data = r2.json()
+            except Exception as e:
+                traceback.print_exc()
+                raise RuntimeError(f"Error calling Node2: {e}")
+            
+            # Return Node 2's results
+            return jsonify({
+                "generated": node2_data["responses"][0],
+                "sentiment": node2_data["sentiments"][0],
+                "toxicity": node2_data["toxicity"][0]
+            })
+                
+        # Node 2: Rerank + LLM + sentiment + safety
         if stage == "rerank_llm_sentiment_safety":
             if NODE_NUMBER != 2:
                 return jsonify({"error": "rerank_llm_sentiment_safety stage only on node 2"}), 400
+            
             queries = payload.get("queries", [])
             documents = payload.get("documents", [])
+            
             reranked = pipeline._rerank_documents_batch(queries, documents)
             responses = pipeline._generate_responses_batch(queries, reranked)
             sentiments = pipeline._analyze_sentiment_batch(responses)
             toxicity = pipeline._filter_response_safety_batch(responses)
+            
             return jsonify({
                 "responses": responses,
                 "sentiments": sentiments,
@@ -436,14 +454,14 @@ def main():
     """
     global pipeline
     print("="*60)
-    print("DISTRIBUTED CUSTOMER SUPPORT PIPELINE")
+    print("DISTRIBUTED CUSTOMER SUPPORT PIPELINE (CORRECTED v2)")
     print("="*60)
     print(f"Node {NODE_NUMBER}/{TOTAL_NODES}")
     print(f"Node IPs: 0={NODE_0_IP}, 1={NODE_1_IP}, 2={NODE_2_IP}")
-    print("\nNOTE: This is the MVP distributed version. Node responsibilities:")
-    print("  Node 0: client handle, embedding")
-    print("  Node 1: FAISS +document fetch")
-    print("  Node 2: reranker +LLM +sentiment +safety")
+    print("\nNode responsibilities:")
+    print("  Node 0: Client handling + embedding")
+    print("  Node 1: FAISS search + document fetch")
+    print("  Node 2: Reranker + LLM + sentiment + safety")
     print("")
 
     # Initialize pipeline
@@ -451,8 +469,9 @@ def main():
     pipeline = MonolithicPipeline()
     print("Pipeline initialized!")
     
+    # Restrict methods to appropriate nodes
     if NODE_NUMBER == 0:
-        #node 0 should not run anything
+        # Node 0: Only embedding allowed
         def not_allowed(*args, **kwargs):
             raise RuntimeError("This node is not responsible for this stage (NODE 0).")
         pipeline._faiss_search_batch = not_allowed
@@ -463,7 +482,7 @@ def main():
         pipeline._filter_response_safety_batch = not_allowed
 
     elif NODE_NUMBER == 1:
-        # node 1 for FAISS + fetch 
+        # Node 1: Only FAISS + fetch allowed
         def not_allowed(*args, **kwargs):
             raise RuntimeError("This node is not responsible for this stage (NODE 1).")
         pipeline._generate_embeddings_batch = not_allowed
@@ -473,7 +492,7 @@ def main():
         pipeline._filter_response_safety_batch = not_allowed
 
     elif NODE_NUMBER == 2:
-        # node 2 : rerank + LLM + sentiment + safety
+        # Node 2: Only rerank + LLM + sentiment + safety allowed
         def not_allowed(*args, **kwargs):
             raise RuntimeError("This node is not responsible for this stage (NODE 2).")
         pipeline._generate_embeddings_batch = not_allowed
@@ -481,9 +500,9 @@ def main():
         pipeline._fetch_documents_batch = not_allowed
 
     else:
-        raise RuntimeError("NODE_NUMBER must be 0,1, or 2 for this MVP")
+        raise RuntimeError("NODE_NUMBER must be 0, 1, or 2.")
 
-    print("Pipeline initialized (node-specific methods constrained).")
+    print("Node restrictions applied successfully!")
 
     # Start worker thread on Node 0 to handle client queue 
     if NODE_NUMBER == 0:
@@ -498,9 +517,8 @@ def main():
         port = int(node_ip.split(':')[1]) if ':' in node_ip else 8000 + NODE_NUMBER
         print(f"Starting Flask on {hostname}:{port} (node {NODE_NUMBER})")
         app.run(host=hostname, port=port, threaded=True)
-
     else:
-        raise RuntimeError("Node IP not working to open program.")
+        raise RuntimeError("Node IP environment variable not set.")
 
 if __name__ == "__main__":
     main()
