@@ -78,7 +78,7 @@ class MonolithicPipeline:
         print(f"[node {NODE_NUMBER}] FAISS index path: {CONFIG['faiss_index_path']}")
         print(f"[node {NODE_NUMBER}] Documents path: {CONFIG['documents_path']}")
 
-        self.global_batch_size = 16  # batch size for each stage of pipeline
+        self.global_batch_size = 4  # batch size for each stage of pipeline
 
         # Model names
         if NODE_NUMBER == 0:
@@ -387,7 +387,9 @@ def process_requests_worker():
 
             # Store result
             with results_lock:
-                for req, gen, snt, tox in zip(reqs, generated, sentiment, toxicity):
+                for item, req, gen, snt, tox in zip(
+                    batch, reqs, generated, sentiment, toxicity
+                ):
                     response_payload = {
                         "request_id": req.request_id,
                         "generated_response": gen,
@@ -396,9 +398,10 @@ def process_requests_worker():
                         "processing_time": processing_time,
                     }
                     results[req.request_id] = response_payload
+                    item["response_queue"].put(response_payload)
 
-            for _ in batch:
-                request_queue.task_done()
+                for _ in batch:
+                    request_queue.task_done()
         except Exception as e:
             print(f"[node {NODE_NUMBER}] Error in worker: {e}")
             traceback.print_exc()
@@ -427,24 +430,20 @@ def handle_query():
             if request_id in results:
                 return jsonify(results.pop(request_id)), 200
 
+        response_queue = Queue()
         print(f"queueing request {request_id}")
         # Add to queue
-        request_queue.put({"request_id": request_id, "query": query})
+        request_queue.put(
+            {"request_id": request_id, "query": query, "response_queue": response_queue}
+        )
 
         # Wait for processing (with timeout). Very inefficient - would suggest using a more efficient waiting and timeout mechanism.
         timeout = 300  # 5 minutes
-        start_wait = time.time()
-        while True:
-            with results_lock:
-                if request_id in results:
-                    result = results.pop(request_id)
-                    return jsonify(result), 200
-
-            if time.time() - start_wait > timeout:
-                return jsonify({"error": "Request timeout"}), 504
-
-            time.sleep(0.1)
-
+        try:
+            result = response_queue.get(timeout=timeout)
+        except queue.Empty:
+            return jsonify({"error": "Request timeout"}), 504
+        return jsonify(result), 200
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
