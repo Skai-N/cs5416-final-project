@@ -89,8 +89,8 @@ class MonolithicPipeline:
 
         # Node responsibilities:
         if NODE_NUMBER == 0:
-            # Node 0: orchestration + embeddings + FAISS + postprocessing (sentiment/safety)
-            print("[Node 0] Loading embedding model, FAISS, DB, sentiment and safety models...")
+            # Node 0: orchestration + embeddings + FAISS only
+            print("[Node 0] Loading embedding model, FAISS, and DB...")
 
             # Embedding model
             self.embedding_model_name = "BAAI/bge-base-en-v1.5"
@@ -106,29 +106,15 @@ class MonolithicPipeline:
             self.db_conn = sqlite3.connect(self.db_path, check_same_thread=False)
             print("[Node 0]   Documents DB connected.")
 
-            # Sentiment & safety
-            self.sentiment_model_name = "nlptown/bert-base-multilingual-uncased-sentiment"
-            self.safety_model_name = "unitary/toxic-bert"
-
-            print("[Node 0]   Loading sentiment classifier...")
-            self.sentiment_classifier = hf_pipeline(
-                "sentiment-analysis",
-                model=self.sentiment_model_name,
-                device=-1  # CPU pipeline uses -1
-            )
-            print("[Node 0]   Loading safety classifier...")
-            self.safety_classifier = hf_pipeline(
-                "text-classification",
-                model=self.safety_model_name,
-                device=-1
-            )
             print("[Node 0] All Node-0 models loaded!")
 
         elif NODE_NUMBER in (1, 2):
-            # Node 1 & Node 2: rerank + LLM generation
-            print(f"[Node {NODE_NUMBER}] Loading reranker and LLM models...")
+            # Node 1 & Node 2: rerank + LLM generation + postprocessing (sentiment + safety)
+            print(f"[Node {NODE_NUMBER}] Loading reranker, LLM, sentiment, and safety models...")
             self.reranker_model_name = "BAAI/bge-reranker-base"
             self.llm_model_name = "Qwen/Qwen2.5-0.5B-Instruct"
+            self.sentiment_model_name = "nlptown/bert-base-multilingual-uncased-sentiment"
+            self.safety_model_name = "unitary/toxic-bert"
 
             # Reranker
             print(f"[Node {NODE_NUMBER}]   Loading reranker...")
@@ -145,6 +131,20 @@ class MonolithicPipeline:
             ).to(self.device)
             self.llm_tokenizer = AutoTokenizer.from_pretrained(self.llm_model_name)
             self.llm_model.eval()
+
+            # Sentiment & safety
+            print(f"[Node {NODE_NUMBER}]   Loading sentiment classifier...")
+            self.sentiment_classifier = hf_pipeline(
+                "sentiment-analysis",
+                model=self.sentiment_model_name,
+                device=-1  # CPU pipeline uses -1
+            )
+            print(f"[Node {NODE_NUMBER}]   Loading safety classifier...")
+            self.safety_classifier = hf_pipeline(
+                "text-classification",
+                model=self.safety_model_name,
+                device=-1
+            )
 
             # DB connection (fetching documents)
             self.db_path = f"{CONFIG['documents_path']}/documents.db"
@@ -262,7 +262,7 @@ class MonolithicPipeline:
         responses = self.llm_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
         return responses
 
-    # Sentiment & safety analysis (Node 0)
+    # Sentiment & safety analysis (Node 1/2 now)
     def _analyze_sentiment_batch(self, texts: List[str]) -> List[str]:
         truncated_texts = [text[:CONFIG['truncate_length']] for text in texts]
         raw_results = self.sentiment_classifier(truncated_texts)
@@ -300,15 +300,15 @@ class MonolithicPipeline:
 pipeline = None
 
 def send_to_generation_node(node_url: str, sub_queries: List[str], sub_doc_ids: List[List[int]], 
-                             start_idx: int, end_idx: int) -> Tuple[int, int, List[str], float, Dict]:
+                             start_idx: int, end_idx: int) -> Tuple[int, int, List[str], List[str], List[bool], float, Dict]:
     """
     Helper function to send a sub-batch to a generation node.
-    Returns (start_idx, end_idx, responses, elapsed_time, node_timing) for result placement.
+    Returns (start_idx, end_idx, responses, sentiments, toxicity_flags, elapsed_time, node_timing) for result placement.
     """
     node_start = time.time()
     try:
         r = requests.post(node_url, json={
-            "stage": "fetch_rerank_llm",
+            "stage": "fetch_rerank_llm_postprocess",
             "payload": {
                 "queries": sub_queries,
                 "doc_ids": sub_doc_ids
@@ -322,15 +322,25 @@ def send_to_generation_node(node_url: str, sub_queries: List[str], sub_doc_ids: 
         # Extract timing breakdown from node response
         node_timing = node_data.get("timing_breakdown", {})
         
-        return (start_idx, end_idx, node_data["responses"], elapsed, node_timing)
+        return (
+            start_idx, 
+            end_idx, 
+            node_data["responses"], 
+            node_data["sentiments"],
+            node_data["toxicity_flags"],
+            elapsed, 
+            node_timing
+        )
     
     except Exception as ex:
         print(f"[node {NODE_NUMBER}] Error contacting {node_url}: {ex}")
         traceback.print_exc()
         # Return error responses for this sub-batch
         error_responses = [f"Error generating response: {ex}"] * len(sub_queries)
+        error_sentiments = ["neutral"] * len(sub_queries)
+        error_toxicity = [False] * len(sub_queries)
         elapsed = time.time() - node_start
-        return (start_idx, end_idx, error_responses, elapsed, {})
+        return (start_idx, end_idx, error_responses, error_sentiments, error_toxicity, elapsed, {})
 
 def process_requests_worker():
     """Worker thread that processes requests from the queue on Node 0 (orchestration)."""
@@ -369,10 +379,8 @@ def process_requests_worker():
                 'batch_wait_time': batch_wait_time,
                 'embedding_time': 0.0,
                 'faiss_search_time': 0.0,
-                'llm_generation_time': 0.0,
+                'parallel_generation_and_postprocessing_time': 0.0,
                 'node_times': {},
-                'sentiment_analysis_time': 0.0,
-                'safety_check_time': 0.0,
             }
 
             pipeline_start = time.time()
@@ -393,7 +401,7 @@ def process_requests_worker():
             timing_breakdown['faiss_search_time'] = time.time() - t0
             print(f"[node {NODE_NUMBER}] FAISS search: {timing_breakdown['faiss_search_time']:.3f}s")
 
-            # 2) Split batch between generation nodes for PARALLEL processing
+            # 2) Split batch between generation nodes for PARALLEL processing (including postprocessing)
             gen_nodes = [
                 f"http://{NODE_1_IP}/process_stage",
                 f"http://{NODE_2_IP}/process_stage"
@@ -413,6 +421,8 @@ def process_requests_worker():
                 start_split = end_split
 
             responses_partial = [None] * batch_size
+            sentiments_partial = [None] * batch_size
+            toxicity_partial = [None] * batch_size
 
             # Dispatch sub-batches to generation nodes IN PARALLEL
             t0 = time.time()
@@ -441,10 +451,13 @@ def process_requests_worker():
                 # Collect results as they complete
                 for future, node_url, node_idx in futures:
                     try:
-                        start_idx, end_idx, responses, node_time, node_timing = future.result()
+                        start_idx, end_idx, responses, sentiments, toxicity_flags, node_time, node_timing = future.result()
+                        
                         # Place responses in correct position
-                        for i, resp in enumerate(responses):
+                        for i, (resp, sent, tox) in enumerate(zip(responses, sentiments, toxicity_flags)):
                             responses_partial[start_idx + i] = resp
+                            sentiments_partial[start_idx + i] = sent
+                            toxicity_partial[start_idx + i] = tox
                         
                         # Track individual node time and detailed breakdown
                         node_key = f'node_{node_idx+1}'
@@ -456,26 +469,19 @@ def process_requests_worker():
                         if node_timing:
                             print(f"  Breakdown: Fetch={node_timing.get('fetch_documents', 0):.3f}s, "
                                   f"Rerank={node_timing.get('rerank_documents', 0):.3f}s, "
-                                  f"LLM={node_timing.get('llm_generation', 0):.3f}s")
+                                  f"LLM={node_timing.get('llm_generation', 0):.3f}s, "
+                                  f"Sentiment={node_timing.get('sentiment_analysis', 0):.3f}s, "
+                                  f"Safety={node_timing.get('safety_check', 0):.3f}s")
                     except Exception as ex:
                         print(f"[node {NODE_NUMBER}] Error collecting future result: {ex}")
                         traceback.print_exc()
 
-            timing_breakdown['llm_generation_time'] = time.time() - t0
-            print(f"[node {NODE_NUMBER}] Parallel LLM generation (wall time): {timing_breakdown['llm_generation_time']:.3f}s")
+            timing_breakdown['parallel_generation_and_postprocessing_time'] = time.time() - t0
+            print(f"[node {NODE_NUMBER}] Parallel generation + postprocessing (wall time): {timing_breakdown['parallel_generation_and_postprocessing_time']:.3f}s")
 
             generations = responses_partial
-
-            # 3) Postprocess locally (sentiment + safety)
-            t0 = time.time()
-            sentiments = pipeline._analyze_sentiment_batch(generations)
-            timing_breakdown['sentiment_analysis_time'] = time.time() - t0
-            print(f"[node {NODE_NUMBER}] Sentiment analysis: {timing_breakdown['sentiment_analysis_time']:.3f}s")
-            
-            t0 = time.time()
-            toxicity_flags = pipeline._filter_response_safety_batch(generations)
-            timing_breakdown['safety_check_time'] = time.time() - t0
-            print(f"[node {NODE_NUMBER}] Safety check: {timing_breakdown['safety_check_time']:.3f}s")
+            sentiments = sentiments_partial
+            toxicity_flags = toxicity_partial
 
             total_processing_time = time.time() - pipeline_start
             timing_breakdown['total_processing_time'] = total_processing_time
@@ -487,7 +493,7 @@ def process_requests_worker():
             print(f"Batch wait time:      {timing_breakdown['batch_wait_time']:>8.3f}s")
             print(f"Embedding generation: {timing_breakdown['embedding_time']:>8.3f}s")
             print(f"FAISS search:         {timing_breakdown['faiss_search_time']:>8.3f}s")
-            print(f"LLM generation:       {timing_breakdown['llm_generation_time']:>8.3f}s (parallel wall time)")
+            print(f"Parallel gen+post:    {timing_breakdown['parallel_generation_and_postprocessing_time']:>8.3f}s (wall time)")
             
             # Show individual node times
             for node_key, node_data in timing_breakdown['node_times'].items():
@@ -497,10 +503,10 @@ def process_requests_worker():
                     if breakdown:
                         print(f"       ├─ Fetch:       {breakdown.get('fetch_documents', 0):>8.3f}s")
                         print(f"       ├─ Rerank:      {breakdown.get('rerank_documents', 0):>8.3f}s")
-                        print(f"       └─ LLM gen:     {breakdown.get('llm_generation', 0):>8.3f}s")
+                        print(f"       ├─ LLM gen:     {breakdown.get('llm_generation', 0):>8.3f}s")
+                        print(f"       ├─ Sentiment:   {breakdown.get('sentiment_analysis', 0):>8.3f}s")
+                        print(f"       └─ Safety:      {breakdown.get('safety_check', 0):>8.3f}s")
             
-            print(f"Sentiment analysis:   {timing_breakdown['sentiment_analysis_time']:>8.3f}s")
-            print(f"Safety check:         {timing_breakdown['safety_check_time']:>8.3f}s")
             print(f"{'-'*60}")
             print(f"TOTAL:                {total_processing_time:>8.3f}s")
             print(f"{'='*60}\n")
@@ -577,17 +583,17 @@ def process_stage():
     Process pipeline stages for inter-node communication.
 
     Generation nodes (Node 1 & Node 2) respond to:
-    - "fetch_rerank_llm" -> returns generated text
+    - "fetch_rerank_llm_postprocess" -> returns generated text + sentiment + toxicity
     """
     try:
         data = request.json
         stage = data.get("stage")
         payload = data.get("payload")
 
-        # Node 1 & Node 2: fetch + rerank + LLM
-        if stage == "fetch_rerank_llm":
+        # Node 1 & Node 2: fetch + rerank + LLM + postprocessing
+        if stage == "fetch_rerank_llm_postprocess":
             if NODE_NUMBER not in (1, 2):
-                return jsonify({"error": "fetch_rerank_llm stage only on node 1 or 2"}), 400
+                return jsonify({"error": "fetch_rerank_llm_postprocess stage only on node 1 or 2"}), 400
 
             stage_start = time.time()
             timing_breakdown = {}
@@ -610,16 +616,30 @@ def process_stage():
             responses = pipeline._generate_responses_batch(queries, reranked)
             timing_breakdown['llm_generation'] = time.time() - t0
             
+            # Analyze sentiment
+            t0 = time.time()
+            sentiments = pipeline._analyze_sentiment_batch(responses)
+            timing_breakdown['sentiment_analysis'] = time.time() - t0
+            
+            # Check safety
+            t0 = time.time()
+            toxicity_flags = pipeline._filter_response_safety_batch(responses)
+            timing_breakdown['safety_check'] = time.time() - t0
+            
             timing_breakdown['total'] = time.time() - stage_start
 
             print(f"[node {NODE_NUMBER}] Stage timing for {len(queries)} queries:")
             print(f"  - Fetch: {timing_breakdown['fetch_documents']:.3f}s")
             print(f"  - Rerank: {timing_breakdown['rerank_documents']:.3f}s")
             print(f"  - LLM: {timing_breakdown['llm_generation']:.3f}s")
+            print(f"  - Sentiment: {timing_breakdown['sentiment_analysis']:.3f}s")
+            print(f"  - Safety: {timing_breakdown['safety_check']:.3f}s")
             print(f"  - Total: {timing_breakdown['total']:.3f}s")
 
             return jsonify({
                 "responses": responses,
+                "sentiments": sentiments,
+                "toxicity_flags": toxicity_flags,
                 "timing_breakdown": timing_breakdown
             })
 
@@ -639,16 +659,16 @@ def health():
 def main():
     global pipeline
     print("="*60)
-    print("DISTRIBUTED CUSTOMER SUPPORT PIPELINE (PARALLEL LLM)")
+    print("DISTRIBUTED CUSTOMER SUPPORT PIPELINE (PARALLEL POSTPROCESSING)")
     print("="*60)
     print(f"Node {NODE_NUMBER}/{TOTAL_NODES}")
     print(f"Node IPs: 0={NODE_0_IP}, 1={NODE_1_IP}, 2={NODE_2_IP}")
     print("")
     if NODE_NUMBER == 0:
-        print("  Node 0: Orchestration + embeddings + FAISS + postprocessing (sentiment, safety)")
-        print("  >>> PARALLEL dispatch to Node 1 & Node 2 for LLM generation")
+        print("  Node 0: Orchestration + embeddings + FAISS")
+        print("  >>> PARALLEL dispatch to Node 1 & Node 2 for LLM generation + postprocessing")
     else:
-        print(f"  Node {NODE_NUMBER}: fetch + rerank + LLM generation")
+        print(f"  Node {NODE_NUMBER}: fetch + rerank + LLM generation + sentiment + safety")
 
     # Initialize pipeline
     print("Initializing pipeline...")
@@ -659,18 +679,18 @@ def main():
     if NODE_NUMBER == 0:
         def not_allowed(*args, **kwargs):
             raise RuntimeError("This node is not responsible for this stage (NODE 0).")
-        # Node 0 should not run rerank/LLM generation
+        # Node 0 should not run rerank/LLM generation/postprocessing
         pipeline._rerank_documents_batch = not_allowed
         pipeline._generate_responses_batch = not_allowed
+        pipeline._analyze_sentiment_batch = not_allowed
+        pipeline._filter_response_safety_batch = not_allowed
 
     elif NODE_NUMBER in (1, 2):
         def not_allowed(*args, **kwargs):
             raise RuntimeError(f"This node is not responsible for this stage (NODE {NODE_NUMBER}).")
-        # Node 1/2 should not run embedding/FAISS or sentiment/safety
+        # Node 1/2 should not run embedding/FAISS
         pipeline._generate_embeddings_batch = not_allowed
         pipeline._faiss_search_batch = not_allowed
-        pipeline._analyze_sentiment_batch = not_allowed
-        pipeline._filter_response_safety_batch = not_allowed
 
     print("Node restrictions applied successfully!")
 
