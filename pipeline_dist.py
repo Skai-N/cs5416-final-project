@@ -1,4 +1,3 @@
-# Save this file and run on each host with NODE_NUMBER env var (0,1,2) and appropriate NODE_?_IP values.
 import os
 import gc
 import json
@@ -39,7 +38,7 @@ DOCUMENTS_DIR = os.environ.get('DOCUMENTS_DIR', 'documents/')
 
 # for pipeline testing:
 BATCH_TIMEOUT = int(os.environ.get('BATCH_TIMEOUT', 25))
-BATCH_MAX_SIZE = int(os.environ.get('BATCH_MAX_SIZE', 32))
+BATCH_MAX_SIZE = int(os.environ.get('BATCH_MAX_SIZE', 4))
 
 # Configuration
 CONFIG = {
@@ -76,7 +75,6 @@ class PipelineResponse:
 
 class MonolithicPipeline:
     def __init__(self):
-        # Use CPU by default; you can change to cuda if available and models/support that.
         self.device = torch.device('cpu')
         print(f"[node {NODE_NUMBER}] Initializing pipeline on {self.device}")
         print(f"[node {NODE_NUMBER}] FAISS index path: {CONFIG['faiss_index_path']}")
