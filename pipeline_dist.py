@@ -22,9 +22,9 @@ from queue import Queue
 import threading
 import traceback
 import requests
-from flask_compress import Compress
+# from flask_compress import Compress
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from memory_profiler import profile
+# from memory_profiler import profile
 
 warnings.filterwarnings("ignore")
 
@@ -151,7 +151,7 @@ class DistributedPipeline:
         else:
             raise RuntimeError("NODE_NUMBER must be 0, 1, or 2.")
 
-    @profile
+    # @profile
     #embedding+ FAISS (Node 0)
     def _generate_embeddings_batch(self, texts: List[str]) -> np.ndarray:
         embeddings = self.embedding_model.encode(
@@ -161,13 +161,13 @@ class DistributedPipeline:
         )
         return embeddings
 
-    @profile
+    # @profile
     def _faiss_search_batch(self, query_embeddings: np.ndarray) -> List[List[int]]:
         query_embeddings = query_embeddings.astype('float32')
         _, indices = self.index.search(query_embeddings, CONFIG['retrieval_k'])
         return [row.tolist() for row in indices]
 
-    @profile
+    # @profile
     #fetch documents from database (Node 1/2)
     def _fetch_documents_batch(self, doc_id_batches: List[List[int]]) -> List[List[Dict]]:
         cursor = self.db_conn.cursor()
@@ -190,7 +190,7 @@ class DistributedPipeline:
             documents_batch.append(documents)
         return documents_batch
 
-    @profile
+    # @profile
     #rerank (Node 1/2)
     def _rerank_documents_batch(self, queries: List[str], documents_batch: List[List[Dict]]) -> List[List[Dict]]:
         reranked_batches = []
@@ -213,7 +213,7 @@ class DistributedPipeline:
             reranked_batches.append([doc for doc, _ in doc_scores])
         return reranked_batches
 
-    @profile
+    # @profile
     # LLM generation (Node 1/2)
     def _generate_responses_batch(self, queries: List[str], documents_batch: List[List[Dict]]) -> List[str]:
         all_messages = []
@@ -263,7 +263,7 @@ class DistributedPipeline:
         responses = self.llm_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
         return responses
 
-    @profile
+    # @profile
     # Sentiment + safety analysis (Node 1/2)
     def _analyze_sentiment_batch(self, texts: List[str]) -> List[str]:
         truncated_texts = [text[:CONFIG['truncate_length']] for text in texts]
@@ -280,7 +280,7 @@ class DistributedPipeline:
             sentiments.append(sentiment_map.get(result['label'], 'neutral'))
         return sentiments
     
-    @profile
+    # @profile
     def _filter_response_safety_batch(self, texts: List[str]) -> List[bool]:
         truncated_texts = [text[:CONFIG['truncate_length']] for text in texts]
         raw_results = self.safety_classifier(truncated_texts)
