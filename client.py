@@ -142,7 +142,7 @@ def main():
     # Send 6 requests at 10-second intervals
     for i in range(num_requests):
         # Calculate when this request should be sent
-        target_send_time = start_time + (i*10)
+        target_send_time = start_time + (i)
 
         # Wait until the target send time
         current_time = time.time()

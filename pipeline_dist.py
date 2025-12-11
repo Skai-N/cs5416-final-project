@@ -1,4 +1,3 @@
-# Save this file and run on each host with NODE_NUMBER env var (0,1,2) and appropriate NODE_?_IP values.
 import os
 import gc
 import json
@@ -25,6 +24,7 @@ import traceback
 import requests
 from flask_compress import Compress
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from memory_profiler import profile
 
 warnings.filterwarnings("ignore")
 
@@ -39,7 +39,7 @@ DOCUMENTS_DIR = os.environ.get('DOCUMENTS_DIR', 'documents/')
 
 # for pipeline testing:
 BATCH_TIMEOUT = int(os.environ.get('BATCH_TIMEOUT', 25))
-BATCH_MAX_SIZE = int(os.environ.get('BATCH_MAX_SIZE', 2))
+BATCH_MAX_SIZE = int(os.environ.get('BATCH_MAX_SIZE', 4))
 
 # Configuration
 CONFIG = {
@@ -53,7 +53,7 @@ CONFIG = {
 
 # Flask app
 app = Flask(__name__)
-Compress(app)
+# Compress(app)
 
 # Request queue and results storage
 request_queue = Queue()
@@ -75,17 +75,14 @@ class PipelineResponse:
     processing_time: float
     timing_breakdown: Dict[str, float] = None
 
-class MonolithicPipeline:
+class DistributedPipeline:
     def __init__(self):
-        # Use CPU by default; you can change to cuda if available and models/support that.
         self.device = torch.device('cpu')
         print(f"[node {NODE_NUMBER}] Initializing pipeline on {self.device}")
         print(f"[node {NODE_NUMBER}] FAISS index path: {CONFIG['faiss_index_path']}")
         print(f"[node {NODE_NUMBER}] Documents path: {CONFIG['documents_path']}")
 
         self.global_batch_size = BATCH_MAX_SIZE
-        # Round-robin state for generation nodes (only used on node 0)
-        self._gen_round_robin_counter = 0
 
         # Node responsibilities:
         if NODE_NUMBER == 0:
@@ -137,7 +134,7 @@ class MonolithicPipeline:
             self.sentiment_classifier = hf_pipeline(
                 "sentiment-analysis",
                 model=self.sentiment_model_name,
-                device=-1  # CPU pipeline uses -1
+                device=-1  
             )
             print(f"[Node {NODE_NUMBER}]   Loading safety classifier...")
             self.safety_classifier = hf_pipeline(
@@ -146,7 +143,6 @@ class MonolithicPipeline:
                 device=-1
             )
 
-            # DB connection (fetching documents)
             self.db_path = f"{CONFIG['documents_path']}/documents.db"
             self.db_conn = sqlite3.connect(self.db_path, check_same_thread=False)
 
@@ -155,7 +151,8 @@ class MonolithicPipeline:
         else:
             raise RuntimeError("NODE_NUMBER must be 0, 1, or 2.")
 
-    # Embedding + FAISS (Node 0)
+    @profile
+    #embedding+ FAISS (Node 0)
     def _generate_embeddings_batch(self, texts: List[str]) -> np.ndarray:
         embeddings = self.embedding_model.encode(
             texts,
@@ -164,12 +161,14 @@ class MonolithicPipeline:
         )
         return embeddings
 
+    @profile
     def _faiss_search_batch(self, query_embeddings: np.ndarray) -> List[List[int]]:
         query_embeddings = query_embeddings.astype('float32')
         _, indices = self.index.search(query_embeddings, CONFIG['retrieval_k'])
         return [row.tolist() for row in indices]
 
-    # Fetch documents from DB (used by Node 1/2)
+    @profile
+    #fetch documents from database (Node 1/2)
     def _fetch_documents_batch(self, doc_id_batches: List[List[int]]) -> List[List[Dict]]:
         cursor = self.db_conn.cursor()
         documents_batch = []
@@ -191,7 +190,8 @@ class MonolithicPipeline:
             documents_batch.append(documents)
         return documents_batch
 
-    # Rerank (Node 1/2)
+    @profile
+    #rerank (Node 1/2)
     def _rerank_documents_batch(self, queries: List[str], documents_batch: List[List[Dict]]) -> List[List[Dict]]:
         reranked_batches = []
         for query, documents in zip(queries, documents_batch):
@@ -213,6 +213,7 @@ class MonolithicPipeline:
             reranked_batches.append([doc for doc, _ in doc_scores])
         return reranked_batches
 
+    @profile
     # LLM generation (Node 1/2)
     def _generate_responses_batch(self, queries: List[str], documents_batch: List[List[Dict]]) -> List[str]:
         all_messages = []
@@ -249,8 +250,8 @@ class MonolithicPipeline:
                 max_new_tokens=CONFIG['max_tokens'],
                 temperature=0.01,
                 pad_token_id=self.llm_tokenizer.eos_token_id,
-                use_cache=True,
-                do_sample=False,
+                # use_cache=True,
+                # do_sample=False,
             )
 
         # Extract only new tokens for each output
@@ -262,7 +263,8 @@ class MonolithicPipeline:
         responses = self.llm_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
         return responses
 
-    # Sentiment & safety analysis (Node 1/2 now)
+    @profile
+    # Sentiment + safety analysis (Node 1/2)
     def _analyze_sentiment_batch(self, texts: List[str]) -> List[str]:
         truncated_texts = [text[:CONFIG['truncate_length']] for text in texts]
         raw_results = self.sentiment_classifier(truncated_texts)
@@ -277,7 +279,8 @@ class MonolithicPipeline:
         for result in raw_results:
             sentiments.append(sentiment_map.get(result['label'], 'neutral'))
         return sentiments
-
+    
+    @profile
     def _filter_response_safety_batch(self, texts: List[str]) -> List[bool]:
         truncated_texts = [text[:CONFIG['truncate_length']] for text in texts]
         raw_results = self.safety_classifier(truncated_texts)
@@ -286,15 +289,6 @@ class MonolithicPipeline:
             toxicity_flags.append(result['score'] > 0.5)
         return toxicity_flags
 
-    # Helper: choose generation node URL (only used on Node 0)
-    def _choose_generation_node(self) -> str:
-        # Round-robin between NODE_1_IP and NODE_2_IP
-        choice = self._gen_round_robin_counter % 2
-        self._gen_round_robin_counter += 1
-        if choice == 0:
-            return f"http://{NODE_1_IP}/process_stage"
-        else:
-            return f"http://{NODE_2_IP}/process_stage"
 
 # Global pipeline instance
 pipeline = None
@@ -302,8 +296,8 @@ pipeline = None
 def send_to_generation_node(node_url: str, sub_queries: List[str], sub_doc_ids: List[List[int]], 
                              start_idx: int, end_idx: int) -> Tuple[int, int, List[str], List[str], List[bool], float, Dict]:
     """
-    Helper function to send a sub-batch to a generation node.
-    Returns (start_idx, end_idx, responses, sentiments, toxicity_flags, elapsed_time, node_timing) for result placement.
+    Helper function: sends a sub batch of queries to node 1, 2
+    returns: (start_idx, end_idx, responses, sentiments, toxicity_flags, elapsed_time, node_timing)
     """
     node_start = time.time()
     try:
@@ -319,7 +313,7 @@ def send_to_generation_node(node_url: str, sub_queries: List[str], sub_doc_ids: 
         node_data = r.json()
         elapsed = time.time() - node_start
         
-        # Extract timing breakdown from node response
+
         node_timing = node_data.get("timing_breakdown", {})
         
         return (
@@ -335,7 +329,6 @@ def send_to_generation_node(node_url: str, sub_queries: List[str], sub_doc_ids: 
     except Exception as ex:
         print(f"[node {NODE_NUMBER}] Error contacting {node_url}: {ex}")
         traceback.print_exc()
-        # Return error responses for this sub-batch
         error_responses = [f"Error generating response: {ex}"] * len(sub_queries)
         error_sentiments = ["neutral"] * len(sub_queries)
         error_toxicity = [False] * len(sub_queries)
@@ -343,7 +336,7 @@ def send_to_generation_node(node_url: str, sub_queries: List[str], sub_doc_ids: 
         return (start_idx, end_idx, error_responses, error_sentiments, error_toxicity, elapsed, {})
 
 def process_requests_worker():
-    """Worker thread that processes requests from the queue on Node 0 (orchestration)."""
+    """Worker thread that processes requests from the queue on Node 0"""
     global pipeline
     while True:
         try:
@@ -374,7 +367,7 @@ def process_requests_worker():
                 for r in batch
             ]
 
-            # Initialize timing breakdown
+            #for timing profiling:
             timing_breakdown = {
                 'batch_wait_time': batch_wait_time,
                 'embedding_time': 0.0,
@@ -385,8 +378,8 @@ def process_requests_worker():
 
             pipeline_start = time.time()
 
-            # Node 0 orchestration flow:
-            # 1) Embed & FAISS locally
+            # Node 0 orchestration:
+            # 1) Embed & FAISS on Node 0:
             queries = [r.query for r in reqs]
             
             # Embedding step
@@ -401,7 +394,7 @@ def process_requests_worker():
             timing_breakdown['faiss_search_time'] = time.time() - t0
             print(f"[node {NODE_NUMBER}] FAISS search: {timing_breakdown['faiss_search_time']:.3f}s")
 
-            # 2) Split batch between generation nodes for PARALLEL processing (including postprocessing)
+            # 2) Split batch between generation nodes for parallel processing , postprocessing
             gen_nodes = [
                 f"http://{NODE_1_IP}/process_stage",
                 f"http://{NODE_2_IP}/process_stage"
@@ -410,7 +403,7 @@ def process_requests_worker():
             num_nodes = len(gen_nodes)
             batch_size = len(queries)
 
-            # Compute partition indices
+            # get partition indices
             splits = []
             base = batch_size // num_nodes
             remainder = batch_size % num_nodes
@@ -424,7 +417,7 @@ def process_requests_worker():
             sentiments_partial = [None] * batch_size
             toxicity_partial = [None] * batch_size
 
-            # Dispatch sub-batches to generation nodes IN PARALLEL
+            # dispatch sub-batches to generation nodes so they can generate in parallel
             t0 = time.time()
             with ThreadPoolExecutor(max_workers=num_nodes) as executor:
                 futures = []
@@ -437,7 +430,6 @@ def process_requests_worker():
                     sub_doc_ids = doc_ids[s:e]
                     node_url = gen_nodes[node_idx]
                     
-                    # Submit task to thread pool
                     future = executor.submit(
                         send_to_generation_node,
                         node_url,
@@ -448,18 +440,17 @@ def process_requests_worker():
                     )
                     futures.append((future, node_url, node_idx))
                 
-                # Collect results as they complete
+                # Collect results as they get completed
                 for future, node_url, node_idx in futures:
                     try:
                         start_idx, end_idx, responses, sentiments, toxicity_flags, node_time, node_timing = future.result()
                         
-                        # Place responses in correct position
                         for i, (resp, sent, tox) in enumerate(zip(responses, sentiments, toxicity_flags)):
                             responses_partial[start_idx + i] = resp
                             sentiments_partial[start_idx + i] = sent
                             toxicity_partial[start_idx + i] = tox
                         
-                        # Track individual node time and detailed breakdown
+                        # timing profiling
                         node_key = f'node_{node_idx+1}'
                         timing_breakdown['node_times'][node_key] = {
                             'total_time': node_time,
@@ -486,7 +477,7 @@ def process_requests_worker():
             total_processing_time = time.time() - pipeline_start
             timing_breakdown['total_processing_time'] = total_processing_time
             
-            # Print comprehensive timing summary
+            # timing profile
             print(f"\n{'='*60}")
             print(f"[node {NODE_NUMBER}] PIPELINE TIMING SUMMARY (batch size: {len(batch)})")
             print(f"{'='*60}")
@@ -495,7 +486,7 @@ def process_requests_worker():
             print(f"FAISS search:         {timing_breakdown['faiss_search_time']:>8.3f}s")
             print(f"Parallel gen+post:    {timing_breakdown['parallel_generation_and_postprocessing_time']:>8.3f}s (wall time)")
             
-            # Show individual node times
+            # timing profile: individual nodes
             for node_key, node_data in timing_breakdown['node_times'].items():
                 if isinstance(node_data, dict):
                     print(f"  └─ {node_key}:         {node_data['total_time']:>8.3f}s")
@@ -512,19 +503,22 @@ def process_requests_worker():
             print(f"{'='*60}\n")
             
             with results_lock:
-                for req, gen, snt, tox in zip(reqs, generations, sentiments, toxicity_flags):
+                for item, req, gen, snt, tox in zip(
+                    batch, reqs, generations, sentiments, toxicity_flags
+                ):
                     response_payload = {
                         "request_id": req.request_id,
                         "generated_response": gen,
                         "sentiment": snt,
                         "is_toxic": "true" if tox else "false",
                         "processing_time": total_processing_time,
-                        "timing_breakdown": timing_breakdown.copy()
+                        "timing_breakdown": timing_breakdown.copy(),
                     }
                     results[req.request_id] = response_payload
+                    item["response_queue"].put(response_payload)
 
-            for _ in batch:
-                request_queue.task_done()
+                for _ in batch:
+                    request_queue.task_done()
 
         except Exception as e:
             print(f"[node {NODE_NUMBER}] Error in worker: {e}")
@@ -555,24 +549,19 @@ def handle_query():
                 return jsonify(results.pop(request_id)), 200
 
         print(f"[node 0] queueing request {request_id}")
-        request_queue.put({
-            'request_id': request_id,
-            'query': query
-        })
+        response_queue = Queue()
+        request_queue.put(
+            {"request_id": request_id, "query": query, "response_queue": response_queue}
+        )
 
         # Wait for processing result
         timeout = 300  # 5 minutes
         start_wait = time.time()
-        while True:
-            with results_lock:
-                if request_id in results:
-                    result = results.pop(request_id)
-                    return jsonify(result), 200
-
-            if time.time() - start_wait > timeout:
-                return jsonify({'error': 'Request timeout'}), 504
-            time.sleep(0.1)
-
+        try:
+            result = response_queue.get(timeout=timeout)
+        except queue.Empty:
+            return jsonify({"error": "Request timeout"}), 504
+        return jsonify(result), 200
     except Exception as e:
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
@@ -590,7 +579,7 @@ def process_stage():
         stage = data.get("stage")
         payload = data.get("payload")
 
-        # Node 1 & Node 2: fetch + rerank + LLM + postprocessing
+        # Node 1, 2: fetch + rerank + LLM + postprocessing
         if stage == "fetch_rerank_llm_postprocess":
             if NODE_NUMBER not in (1, 2):
                 return jsonify({"error": "fetch_rerank_llm_postprocess stage only on node 1 or 2"}), 400
@@ -616,12 +605,10 @@ def process_stage():
             responses = pipeline._generate_responses_batch(queries, reranked)
             timing_breakdown['llm_generation'] = time.time() - t0
             
-            # Analyze sentiment
             t0 = time.time()
             sentiments = pipeline._analyze_sentiment_batch(responses)
             timing_breakdown['sentiment_analysis'] = time.time() - t0
             
-            # Check safety
             t0 = time.time()
             toxicity_flags = pipeline._filter_response_safety_batch(responses)
             timing_breakdown['safety_check'] = time.time() - t0
@@ -659,48 +646,29 @@ def health():
 def main():
     global pipeline
     print("="*60)
-    print("DISTRIBUTED CUSTOMER SUPPORT PIPELINE (PARALLEL POSTPROCESSING)")
+    print("DISTRIBUTED CUSTOMER SUPPORT PIPELINE")
     print("="*60)
     print(f"Node {NODE_NUMBER}/{TOTAL_NODES}")
     print(f"Node IPs: 0={NODE_0_IP}, 1={NODE_1_IP}, 2={NODE_2_IP}")
     print("")
     if NODE_NUMBER == 0:
         print("  Node 0: Orchestration + embeddings + FAISS")
-        print("  >>> PARALLEL dispatch to Node 1 & Node 2 for LLM generation + postprocessing")
+        print("  >>>dispatch to Node 1 & Node 2 for parallel LLM generation + postprocessing")
     else:
         print(f"  Node {NODE_NUMBER}: fetch + rerank + LLM generation + sentiment + safety")
 
     # Initialize pipeline
     print("Initializing pipeline...")
-    pipeline = MonolithicPipeline()
+    pipeline = DistributedPipeline()
     print("Pipeline initialized!")
 
-    # Apply method restrictions to ensure nodes only expose intended behavior
-    if NODE_NUMBER == 0:
-        def not_allowed(*args, **kwargs):
-            raise RuntimeError("This node is not responsible for this stage (NODE 0).")
-        # Node 0 should not run rerank/LLM generation/postprocessing
-        pipeline._rerank_documents_batch = not_allowed
-        pipeline._generate_responses_batch = not_allowed
-        pipeline._analyze_sentiment_batch = not_allowed
-        pipeline._filter_response_safety_batch = not_allowed
-
-    elif NODE_NUMBER in (1, 2):
-        def not_allowed(*args, **kwargs):
-            raise RuntimeError(f"This node is not responsible for this stage (NODE {NODE_NUMBER}).")
-        # Node 1/2 should not run embedding/FAISS
-        pipeline._generate_embeddings_batch = not_allowed
-        pipeline._faiss_search_batch = not_allowed
-
-    print("Node restrictions applied successfully!")
-
-    # Start worker thread on Node 0 to handle client queue
+    # Start worker thread
     if NODE_NUMBER == 0:
         worker_thread = threading.Thread(target=process_requests_worker, daemon=True)
         worker_thread.start()
         print("Worker thread started on Node 0")
 
-    # Start Flask server on this node
+    # Start Flask server
     node_ip = os.environ.get(f"NODE_{NODE_NUMBER}_IP", None)
     if node_ip:
         hostname = node_ip.split(':')[0]
